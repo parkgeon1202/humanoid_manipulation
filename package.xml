@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>humanoid_manipulation</name>
+  <version>0.0.0</version>
+  <description>공 집기/슛 매니퓰레이션: FSM/IK/모터 명령 루프를 전부 C++ 노드(main_node/debug_node)가 담당</description>
+  <maintainer email="geonhu@todo.todo">geonhu</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- C++ 하드웨어 인터페이스 노드(lifecycle) 의존성 -->
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>dynamixel_hardware_msgs</depend>
+  <depend>irc_humanoid_interfaces</depend>
+
+  <!-- C++ IK 라이브러리(include/ik, src/ik) 의존성: lib/ik_solver.py + lib/collision_model.py의
+       C++ 포팅용. pinocchio가 coal/Eigen3를 transitively 요구하지만 명시적으로도 선언해둠. -->
+  <depend>eigen</depend>
+  <depend>pinocchio</depend>
+  <depend>coal</depend>
+  <depend>ament_index_cpp</depend>
+  <!-- collision_model.cpp의 URDF <collision><mesh> 파싱용(urdfdom C++ 파서). -->
+  <depend>urdf</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

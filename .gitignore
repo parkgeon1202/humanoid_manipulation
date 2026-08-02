@@ -1,0 +1,35 @@
+cat > .gitignore << 'EOF'
+# colcon / ROS2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# C++
+*.o
+*.so
+*.a
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# ROS2 misc
+*.bag
+*.bag.active
+
+# Claude Code project settings
+.claude/
+
+# ROS2 package marker (empty marker file, no need to track separately)
+resource/
+EOF
