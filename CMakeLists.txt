@@ -29,6 +29,7 @@ find_package(urdf REQUIRED)
 add_library(ik_lib
   src/ik/ik_solver.cpp
   src/ik/collision_model.cpp
+  src/ik/place_trajectory.cpp
 )
 target_include_directories(ik_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -76,6 +77,7 @@ target_link_libraries(debug_ik_node ik_lib)
 ament_target_dependencies(debug_ik_node
   rclcpp
   dynamixel_hardware_msgs
+  irc_humanoid_interfaces
   sensor_msgs
   visualization_msgs
   ament_index_cpp

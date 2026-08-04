@@ -133,6 +133,40 @@ Eigen::VectorXd jointLimitAvoidanceDq(const RobotModel& rm, const Eigen::VectorX
   return -k_pull * gradient;
 }
 
+Eigen::Vector3d eePosition(RobotModel& rm, const Eigen::VectorXd& q) {
+  pinocchio::forwardKinematics(rm.model(), rm.data(), q);
+  pinocchio::updateFramePlacements(rm.model(), rm.data());
+  return rm.data().oMf[rm.eeId()].translation();
+}
+
+double eeDownAlignment(RobotModel& rm, const Eigen::VectorXd& q) {
+  pinocchio::forwardKinematics(rm.model(), rm.data(), q);
+  pinocchio::updateFramePlacements(rm.model(), rm.data());
+  // 회전행렬의 3번째 열이 로컬 Z축을 world 좌표로 표현한 벡터(R * [0,0,1]^T = R.col(2)).
+  const Eigen::Vector3d local_z_in_world = rm.data().oMf[rm.eeId()].rotation().col(2);
+  return local_z_in_world.dot(Eigen::Vector3d(0.0, 0.0, -1.0));
+}
+
+Eigen::VectorXd eeOrientationAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q, double k_pull,
+                                          double eps) {
+  const double s0 = eeDownAlignment(rm, q);
+  Eigen::VectorXd dq = Eigen::VectorXd::Zero(rm.model().nq);
+
+  std::vector<int> indices = {kTorsoJointIndex};
+  for (int idx : kLeftArmIndices) indices.push_back(idx);
+
+  for (int idx : indices) {
+    Eigen::VectorXd q_pert = q;
+    q_pert[idx] += eps;
+    const double s_pert = eeDownAlignment(rm, q_pert);
+    const double grad = (s_pert - s0) / eps;
+    // (s - (-1))^2 = (s+1)^2를 최소화하는 gradient descent 방향
+    // (elbowTorsoAvoidanceDq의 (threshold-d0)^2 최소화와 동일한 형태).
+    dq[idx] = -k_pull * 2.0 * (s0 + 1.0) * grad;
+  }
+  return dq;
+}
+
 IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eigen::VectorXd& q,
                      double damping, const IkStepParams& params,
                      const CollisionCheckFn& collision_checker) {
@@ -140,9 +174,7 @@ IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eig
   pinocchio::Data& data = rm.data();
   const int nq = model.nq;
 
-  pinocchio::forwardKinematics(model, data, q);
-  pinocchio::updateFramePlacements(model, data);
-  const Eigen::Vector3d current_pos = data.oMf[rm.eeId()].translation();
+  const Eigen::Vector3d current_pos = eePosition(rm, q);
   const Eigen::Vector3d error = target_pos - current_pos;
   const double error_norm = error.norm();
 
@@ -165,17 +197,17 @@ IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eig
   const Eigen::VectorXd secondary_dq =
       params.secondary_dq.size() == nq ? params.secondary_dq : Eigen::VectorXd::Zero(nq);
 
-  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(3 + nq + nq + nq, nq);
-  A.topRows(3) = jacobian_pos;
-  A.middleRows(3, nq) = damping * Eigen::MatrixXd::Identity(nq, nq);
+  // 1차 임무(위치)만으로 bounded LSQ를 풀어서 dq_primary를 구함. damping/joint_weight_scale
+  // 정규화는 "1차 임무를 어떻게 푸는가"에 대한 것이지 2차목표가 아니라서 여기 포함.
+  Eigen::MatrixXd A_primary = Eigen::MatrixXd::Zero(3 + nq + nq, nq);
+  A_primary.topRows(3) = jacobian_pos;
+  A_primary.middleRows(3, nq) = damping * Eigen::MatrixXd::Identity(nq, nq);
   Eigen::MatrixXd weight_block = Eigen::MatrixXd::Zero(nq, nq);
   weight_block.diagonal() = params.joint_weight_scale * joint_weights.array().sqrt().matrix();
-  A.middleRows(3 + nq, nq) = weight_block;
-  A.bottomRows(nq) = std::sqrt(params.secondary_gain) * Eigen::MatrixXd::Identity(nq, nq);
+  A_primary.bottomRows(nq) = weight_block;
 
-  Eigen::VectorXd b = Eigen::VectorXd::Zero(3 + nq + nq + nq);
-  b.topRows(3) = error;
-  b.bottomRows(nq) = std::sqrt(params.secondary_gain) * secondary_dq;
+  Eigen::VectorXd b_primary = Eigen::VectorXd::Zero(3 + nq + nq);
+  b_primary.topRows(3) = error;
 
   Eigen::VectorXd lb = model.lowerPositionLimit - q;
   Eigen::VectorXd ub = model.upperPositionLimit - q;
@@ -184,7 +216,28 @@ IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eig
     ub[idx] = 1e-9;
   }
 
-  const Eigen::VectorXd dq_full = detail::solveBoundedLsq(A, b, lb, ub);
+  const Eigen::VectorXd dq_primary = detail::solveBoundedLsq(A_primary, b_primary, lb, ub);
+
+  // 2차목표(secondary_dq, 예: 그리퍼 방향 정렬)는 절대 1차 임무(위치)를 건드리지
+  // 않도록 위치 자코비안의 null-space로 투영해서만 더함(Nakamura의 damped
+  // null-space projection과 동일한 아이디어: N = I - J^+J, J^+ = J^T(JJ^T + eps*I)^-1).
+  // 이전엔 secondary_dq를 같은 최소자승 문제에 그냥 얹어서 위치 수렴을 방해했음
+  // (자유도가 4개뿐이라 방향 보정 방향 = 위치를 흔드는 방향이기도 했음) - 이제는
+  // J_pos @ (N @ anything) ≈ 0이라 위치 결과가 secondary_dq 유무와 무관하게 유지됨.
+  Eigen::VectorXd dq_full = dq_primary;
+  if (secondary_dq.squaredNorm() > 0.0 && params.secondary_gain > 0.0) {
+    constexpr double kNullSpaceRegularization = 1e-8;
+    const Eigen::Matrix3d jjt_damped = jacobian_pos * jacobian_pos.transpose() +
+                                        kNullSpaceRegularization * Eigen::Matrix3d::Identity();
+    const Eigen::MatrixXd jacobian_pos_pinv = jacobian_pos.transpose() * jjt_damped.inverse();
+    const Eigen::MatrixXd null_space_projector =
+        Eigen::MatrixXd::Identity(nq, nq) - jacobian_pos_pinv * jacobian_pos;
+    dq_full += null_space_projector * (params.secondary_gain * secondary_dq);
+    // dq_primary는 이미 bound를 만족하는 상태였는데 투영된 2차 보정을 더하면 다시
+    // 넘을 수 있음 - 엄밀한 재-QP 대신 표준 null-space IK 구현들처럼 clamp만 함.
+    dq_full = dq_full.cwiseMax(lb).cwiseMin(ub);
+  }
+
   const Eigen::VectorXd dq = params.alpha * dq_full;
 
   Eigen::VectorXd q_candidate(model.nq);
@@ -206,14 +259,6 @@ IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eig
       error_norm * error_norm - (jacobian_pos * dq - error).squaredNorm();
   const double actual_reduction = error_norm * error_norm - candidate_error_norm * candidate_error_norm;
   const double rho = predicted_reduction < 1e-12 ? -1.0 : actual_reduction / predicted_reduction;
-
-  if (secondary_dq.squaredNorm() > 0.0) {
-    result.q = q_candidate;
-    result.converged = false;
-    result.damping = damping;
-    result.hard_rejected = false;
-    return result;
-  }
 
   if (rho > params.trust_region_good_ratio) {
     result.q = q_candidate;

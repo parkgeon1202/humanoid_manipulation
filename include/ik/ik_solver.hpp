@@ -88,6 +88,24 @@ struct IkStepResult {
 Eigen::VectorXd jointLimitAvoidanceDq(const RobotModel& rm, const Eigen::VectorXd& q,
                                        double k_pull = 1.0);
 
+// q에 대한 forward kinematics를 갱신하고 ee 프레임의 월드 좌표를 반환. ikStep이 내부적으로
+// 하던 것과 동일 - place_trajectory처럼 IK 없이 "지금 이 q에서 EE가 어디 있는지"만
+// 필요한 외부 호출부가 재사용하도록 뺌.
+Eigen::Vector3d eePosition(RobotModel& rm, const Eigen::VectorXd& q);
+
+// ee_link_1의 로컬 Z축(그리퍼가 물건을 향해 뻗는 축)이 world -Z(바로 아래 방향)와 얼마나
+// 정렬됐는지를 나타내는 스칼라. -1이면 완벽히 아래를 향함(이상적인 top-down 그립),
+// +1이면 완벽히 위를 향함(정반대).
+double eeDownAlignment(RobotModel& rm, const Eigen::VectorXd& q);
+
+// torso_yaw + 왼팔 3관절에 대해, eeDownAlignment(q)를 -1(완전히 아래)에 최대한 가깝게
+// 만드는 방향으로 당기는 dq를 유한차분으로 근사해서 반환(secondary_dq로 바로 사용 가능).
+// elbowTorsoAvoidanceDq(collision_model.hpp)와 동일한 유한차분 패턴이지만, threshold로
+// 게이팅하지 않고 항상 당김(정렬은 "가까워지면"이 아니라 "항상 최대한" 원하는 목표라서).
+// 오른팔/tilt는 이 정렬에 영향이 없어 계산하지 않음.
+Eigen::VectorXd eeOrientationAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q,
+                                          double k_pull = 1.0, double eps = 1e-4);
+
 // torso + 왼팔(오른팔은 항상 고정, kRightArmIndices)을 사용해서 한 스텝 진행. 도달 가능한
 // 거리에서 사용(scripts/lib/ik_solver.py의 ik_step()에 대응). 도달 불가능 모드 전용이었던
 // ik_step_arm_only는 포팅하지 않음 — 그 기능은 곧 허리 고정 회전 방식으로 완전히 대체될 예정.

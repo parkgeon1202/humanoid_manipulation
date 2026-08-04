@@ -2,7 +2,12 @@ debug_ik_node:
   ros__parameters:
     # main_node.yaml의 dynamixel_control/motor_status와 동일한 실제 모터 토픽.
     control_topic: /dynamixel_control
+    gripper_topic: /gripper_control
     status_topic: /motor_status
+
+    # fsm.cpp의 entry_motion_number()가 SIT 진입 시 재생하는 모션 번호(73)와 동일.
+    # 이 노드는 FSM이 없어서 노드가 뜨자마자 딱 한 번 직접 재생함.
+    motion.startup_motion_num: 73
 
     # ik_solve_node.yaml과 동일한 IK/damping 파라미터.
     ik.step_period_sec: 0.02
@@ -28,11 +33,8 @@ debug_ik_node:
     # 동일하게 실제로 명령되는 4개만 지정: [torso_yaw, l_shoulder_pitch,
     # l_shoulder_roll, l_elbow_pitch]. 값이 클수록 그 관절을 더 아껴 씀. 오른팔/
     # tilt는 항상 fixed_indices로 고정돼서 weight 값 자체가 결과에 영향을 안
-    # 주므로 파라미터로 안 받음. 왼팔 3개를 10배 아껴서(torso_yaw는 1) 웬만하면
-    # torso로 풀게 유도. 100배까지 올리면(스윕으로 확인) 특정 케이스 하나에서만
-    # 반짝 더 잘 풀리고 나머지는 비슷하거나 더 불안정해져서, 더 안정적으로
-    # 8/15가 나오던 10배 쪽으로 낮춤(joint_weight_scale=0.005와 짝, 아래 참고).
-    ik.joint_weights: [1.0, 10.0, 10.0, 10.0]
+    # 주므로 파라미터로 안 받음.
+    ik.joint_weights: [1.0, 40.0, 10.0, 30.0]
 
     # joint_weights 앞에 곱해지는 고정 세기. damping(매 tick 바뀌는 LM
     # trust-region 값)에 얹지 않고 완전히 독립적으로 둔 이유: damping에 얹으면
@@ -40,12 +42,16 @@ debug_ik_node:
     # 무의미해짐(실측: damping이 1e-6까지 떨어지면 10배든 100배든 효과 0).
     # 0.0이면 joint_weights 값이 뭐든 이 항 자체가 사라짐. 너무 크면(>=0.05)
     # 오히려 1차 임무를 방해해서 급격히 나빠지므로 작은 값으로 둠.
-    ik.joint_weight_scale: 0.005
+    ik.joint_weight_scale: 0.1
 
-    # null-space 2차목표(elbow_torso_avoidance_dq: left_elbow_1을 torso_1에서
-    # 벌리는 방향) 가중치. 0.0이면 2차목표가 통째로 꺼져서 1차 임무(엔드이펙터
-    # 위치)만으로 풀림.
-    ik.secondary_gain: 0.01
+    # null-space 2차목표(현재는 그리퍼 방향 정렬(eeOrientationAlignmentDq) 전용 -
+    # elbowTorsoAvoidanceDq 충돌회피는 당분간 안 씀) 가중치. EE 위치 오차 항(가중치
+    # 1)과 견줄 만큼 방향 정렬도 중요하게 다루려고 크게 잡음(실기에서 더 튜닝 필요).
+    ik.secondary_gain: 1.0
+
+    # 그리퍼가 물건을 위에서(top-down) 잡도록, ee_link_1 로컬 Z축을 world 아래
+    # 방향(-Z)에 정렬시키는 gradient pull 세기.
+    ik.orientation_align_k_pull: 1.0
 
     # joint_limit_avoidance_dq가 돌려주는 -gradient에 곱하는 계수(방향 자체의
     # 크기). secondary_gain과는 별개 축. 관절 한계는 lb/ub가 이미 절대 못 넘게
@@ -53,58 +59,64 @@ debug_ik_node:
     # 필요해지면 여기 주석 풀고 코드 쪽도 같이 풀면 됨.
     # ik.k_pull: 1.0
 
-    # left_elbow_1-torso_1 메쉬 사이 거리가 이보다(m) 가까워지면 secondary_dq에
-    # 벌어지는 방향이 더해짐(CollisionChecker.elbow_torso_avoidance_dq). 이 거리보다
-    # 멀면 완전히 0이라 계산 자체도 안 함. collision_model.cpp가 원래 링크 로컬 AABB
-    # 박스로 충돌을 근사했을 때는 "정상적으로 충돌 아닌" 자세도 이미 elbow-torso
-    # 거리가 ~1.5mm로 잡혀서(박스가 실제 부피보다 훨씬 큼) 0.03(30mm)이면 거의 항상
-    # 켜져있는 꼴이었고, 그래서 1mm까지 낮췄었음. 실제 메쉬(BVH)로 바꾼 뒤 재보니
-    # home 자세 기준 실거리는 5~9mm 사이임 - 그래도 실제로 팔을 뻗어 목표에 다가갈
-    # 때는 1mm 밑으로도 충분히 가까워지므로(실측 확인), 항상 켜져있지 않으면서도
-    # 진짜 근접할 때는 반응하도록 3mm로 완만하게 올림.
-    ik.collision_avoidance_threshold_m: 0.003
+    # (현재 미사용 - elbowTorsoAvoidanceDq 호출 안 함) left_elbow_1-torso_1 메쉬
+    # 사이 거리가 이보다(m) 가까워지면 secondary_dq에 벌어지는 방향이 더해짐
+    # (CollisionChecker.elbow_torso_avoidance_dq). 이 거리보다 멀면 완전히 0이라
+    # 계산 자체도 안 함. collision_model.cpp가 원래 링크 로컬 AABB 박스로 충돌을
+    # 근사했을 때는 "정상적으로 충돌 아닌" 자세도 이미 elbow-torso 거리가 ~1.5mm로
+    # 잡혀서(박스가 실제 부피보다 훨씬 큼) 0.03(30mm)이면 거의 항상 켜져있는
+    # 꼴이었고, 그래서 1mm까지 낮췄었음. 실제 메쉬(BVH)로 바꾼 뒤 재보니 home 자세
+    # 기준 실거리는 5~9mm 사이임 - 그래도 실제로 팔을 뻗어 목표에 다가갈 때는 1mm
+    # 밑으로도 충분히 가까워지므로(실측 확인), 항상 켜져있지 않으면서도 진짜
+    # 근접할 때는 반응하도록 완만하게 올림(실기 테스트로 6mm까지 조정).
+    ik.collision_avoidance_threshold_m: 0.006
 
-    # 위 회피 방향 자체의 크기(secondary_gain과는 별개 축, k_pull과 동일한 역할을
-    # 충돌 회피 쪽에 따로 둔 것).
+    # (현재 미사용) 위 회피 방향 자체의 크기(secondary_gain과는 별개 축, k_pull과
+    # 동일한 역할을 충돌 회피 쪽에 따로 둔 것).
     ik.collision_avoidance_k_pull: 1.0
 
     # reachable(d) 모드에서 damping이 이만큼 연속 틱 동안 상한에 붙어있으면(=주로
-    # hard 충돌 반려가 반복돼서 더 못 나아가는 상태) "막혔다"고 보고 torso_kick_offsets로
+    # hard 충돌 반려가 반복돼서 더 못 나아가는 상태) "막혔다"고 보고 torso_yaw 킥으로
     # 탈출을 시도함.
     ik.stuck_streak_ticks: 100
 
-    # 막혔을 때 torso_yaw에 순서대로 강제로 대입해볼 후보 값들(rad). torso_yaw는
-    # elbow-torso 거리 자체엔 영향이 없지만, 바뀌면 같은 목표를 향해 팔이 뻗는
-    # 방향 자체가 바뀌어서 충돌 없는 다른 자세 후보가 열릴 수 있음(실측 확인:
-    # 막히던 목표가 torso 시작각만 바꾸니 24~26틱 만에 풀림).
-    ik.torso_kick_offsets: [0.5, 1.0, 1.5, -0.5, -1.0, -1.5]
+    # 막혔을 때 목표-현재 EE의 y 오차 부호를 보고 현재 torso_yaw에서 +/- 이만큼(rad)
+    # 돌림(고정 후보 목록을 순서대로 대입하던 이전 방식 대체 - 목표 쪽 방향으로
+    # 킥하므로 엉뚱한 방향 시행착오가 줄어듦).
+    ik.torso_kick_step_rad: 0.5
 
-    # (C++ debug_ik_node 전용, s 키 1단계) 비전 좌표를 받으면 도달 가능 IK를 풀기
-    # 전에 먼저 허리(torso_yaw)를 이 각도(rad)까지 고정 회전시킴. torso_yaw는
-    # fixed_indices가 아니라 IK가 계속 자유롭게 움직일 수 있는 관절이라, 이 값은
-    # "시작점"일 뿐 최종 각도가 아님(Python debug_ik_node.py는 이 파라미터를
-    # 선언하지 않으므로 그냥 무시함).
-    ik.torso_target_rad: -1.5
+    # torso_yaw 킥과 함께 팔꿈치도 이 각도(rad)만큼 굽혀서 리셋함. 펴둔 채로(0.0)
+    # 두면 다리/공을 치는 경우가 있어서 굽힘.
+    ik.elbow_kick_rad: 1.4
 
-    # 허리가 위 각도까지 실제로 도달했는지 판정하는 기준. 두 조건을 모두 만족해야
-    # "도달"로 보고 2단계(도달 가능 IK)로 자동 전환함: 모터 속도가 이 값 미만이고,
-    # 동시에 목표와의 위치 차이가 아래 값(rad) 이내. 속도만 보면 회전 명령 직후
-    # (아직 움직이기 전) 첫 틱에 "이미 도달했다"고 오판할 수 있어서 위치 조건을
-    # 반드시 같이 봄. CurrentMotorStatus.velocity는 rad/s가 아니라 raw uint8
-    # 단위라서(msg/CurrentMotorStatus.msg 참고), main_node.yaml의 같은 이름
-    # 파라미터(ik.torso_settle_velocity_threshold)와 동일한 스케일(0.3)을 그대로 씀.
+    # 위와 동일한 이유로 어깨 pitch도 0.0 대신 이 각도(rad)로 리셋함.
+    ik.left_shoulder_pitch_kick_rad: -2.3
+
+    # (C++ debug_ik_node 전용) 's' 모드는 팔(shoulder_pitch/roll/elbow)만 킥 자세로
+    # 돌리고(torso_yaw는 그 순간 위치에 고정), 팔이 실제로 도달했는지 판정하는
+    # 기준. 두 조건을 모두 만족해야 "도달"로 보고 도달 가능 IK로 자동 전환함:
+    # 모터 속도가 이 값 미만이고, 동시에 목표와의 위치 차이가 아래 값(rad) 이내.
+    # 속도만 보면 회전 명령 직후(아직 움직이기 전) 첫 틱에 "이미 도달했다"고
+    # 오판할 수 있어서 위치 조건을 반드시 같이 봄. CurrentMotorStatus.velocity는
+    # rad/s가 아니라 raw uint8 단위라서(msg/CurrentMotorStatus.msg 참고),
+    # main_node.yaml의 같은 이름 파라미터(ik.torso_settle_velocity_threshold)와
+    # 동일한 스케일(0.3)을 그대로 씀. torso_yaw는 더 이상 미리 고정 회전시키지
+    # 않으므로(예전엔 이 값(rad)까지 회전 후 대기했음) 팔이 settle되면 바로 IK로
+    # 넘어가고, torso_yaw는 IK가 필요한 만큼만 자유롭게 돌림.
     ik.torso_settle_velocity_threshold: 0.3
     ik.torso_settle_position_tolerance_rad: 0.3
 
     # 그리퍼 열림/닫힘/스텝 각도(도). ik_solve_node.yaml과 동일.
-    gripper.open_deg: 30.0
+    gripper.open_deg: 50.0
     gripper.closed_deg: 0.0
-    gripper.step_deg: 0.6
+    gripper.step_deg: 0.3
 
     # a키로 돌아갈 대기 자세(rad): [torso_yaw, left_shoulder_pitch,
-    # left_shoulder_roll, left_elbow_pitch]. left_shoulder_roll은 main_node.yaml의
-    # ik.left_shoulder_roll_target_rad와 동일하게 1.0으로 맞춤.
-    pick_ready_home_q: [0.0, 0.0, 1.0, 0.0]
+    # left_shoulder_roll, left_elbow_pitch]. left_shoulder_pitch는
+    # ik.left_shoulder_pitch_kick_rad와 동일하게 -2.3으로, left_shoulder_roll은
+    # 위 고정값과 동일하게 1.0으로, left_elbow_pitch는 ik.elbow_kick_rad와
+    # 동일하게 1.4로 맞춤.
+    pick_ready_home_q: [0.0, -2.3, 1.0, 1.4]
 
     # a/s/d 전부 동일하게 사용하는 profile_velocity. main_node.cpp/debug_node.cpp가
     # 대기 자세 텔레포트 때 쓰는 값(1.0)과 동일하게 천천히 이동.

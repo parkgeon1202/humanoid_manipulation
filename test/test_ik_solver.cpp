@@ -181,10 +181,12 @@ TEST(RobotModel, LoadsUrdfAndMatchesPythonEePosition) {
   pinocchio::updateFramePlacements(rm.model(), rm.data());
   const Eigen::Vector3d ee_pos = rm.data().oMf[rm.eeId()].translation();
 
-  // python: lib.ik_solver.data.oMf[ee_id].translation, q=0
+  // python: lib.ik_solver.data.oMf[ee_id].translation, q=0. model/irc_man.urdf의 ee
+  // 조인트 z-origin이 -0.18185 -> -0.15로 바뀌면서(2026-08-04) ee_pos.z()도 같이
+  // 바뀜(x/y는 그 조인트가 z만 바뀌어서 영향 없음).
   EXPECT_NEAR(ee_pos.x(), 0.0179, 1e-4);
   EXPECT_NEAR(ee_pos.y(), 0.1223, 1e-4);
-  EXPECT_NEAR(ee_pos.z(), -0.20665, 1e-4);
+  EXPECT_NEAR(ee_pos.z(), -0.1748, 1e-4);
 }
 
 // -------------------- ikStep golden trace --------------------
@@ -192,7 +194,12 @@ TEST(RobotModel, LoadsUrdfAndMatchesPythonEePosition) {
 TEST(IkStep, MatchesPythonGoldenTrace) {
   // scripts/lib/ik_solver.ik_step를 target=[0.05,0.15,-0.15], joint_weights=
   // [1,10,10,10,1,1,1,1], joint_weight_scale=0.005, secondary_gain=0으로 12틱 돌려서
-  // 뽑아둔 golden trace (collision_checker 없음).
+  // 뽑아둔 golden trace (collision_checker 없음). model/irc_man.urdf의 ee 조인트
+  // z-origin이 -0.18185 -> -0.15로 바뀌면서(2026-08-04) 전체 재계산함 - Python
+  // 대신 pinocchio 파이썬 바인딩 + scipy.optimize.lsq_linear(method='bvls')로
+  // solveBoundedLsq를 재현해서 뽑음(주석에 적힌 대로 동일 알고리즘). 이 geometry에서는
+  // tick9에서 damping이 min_damping(1e-6)까지 떨어지고 tick10부터 tol 안에 들어와
+  // converged=true로 고정됨(그 뒤로는 q/damping 변화 없음 - ikStep의 early-exit).
   struct Tick {
     Eigen::VectorXd q;
     double damping;
@@ -205,34 +212,33 @@ TEST(IkStep, MatchesPythonGoldenTrace) {
     for (double val : vals) v[i++] = val;
     return v;
   };
-  // torso_yaw의 URDF 조인트 한계를 +-1.57rad로 좁히면서(2026-08 하드웨어 테스트로
-  // 확인된 실제 기구 한계 반영) lb/ub 박스 제약이 바뀌어 이 궤적 자체가 달라짐 -
-  // 새 URDF(model/irc_man.urdf)로 다시 뽑아낸 golden trace.
+  // torso_yaw의 URDF 조인트 한계가 지금 +-2.3rad라(model/irc_man.urdf) 이 목표에서는
+  // 한 번도 안 걸림 - 그 범위 안에서 뽑아낸 golden trace.
   const std::vector<Tick> golden = {
-      {v8({-0.0287489383, -0.0285404293, 0.0569236587, -0.0217385943, 0, 0, 0, 0}), 0.0005, false,
+      {v8({-0.04824645231, -0.02783218733, 0.06668499623, -0.01773776966, 0, 0, 0, 0}), 0.0005,
+       false, false},
+      {v8({0.3723819213, -0.1931366868, 0.05097772414, -0.1573027499, 0, 0, 0, 0}), 0.00025,
+       false, false},
+      {v8({0.502396764, -0.2479918652, -0.03049777473, -0.2123357254, 0, 0, 0, 0}), 0.000125,
+       false, false},
+      {v8({0.5373455109, -0.2610458286, -0.06802343984, -0.2283877768, 0, 0, 0, 0}), 6.25e-05,
+       false, false},
+      {v8({0.5523177054, -0.2661437032, -0.08646990027, -0.235257235, 0, 0, 0, 0}), 3.125e-05,
+       false, false},
+      {v8({0.5595784715, -0.2684615687, -0.09578798617, -0.2385273207, 0, 0, 0, 0}), 1.5625e-05,
+       false, false},
+      {v8({0.5632939712, -0.2695934008, -0.1005566545, -0.2401595204, 0, 0, 0, 0}), 7.8125e-06,
+       false, false},
+      {v8({0.5652423559, -0.2701661768, -0.1030129376, -0.2409931553, 0, 0, 0, 0}), 3.90625e-06,
+       false, false},
+      {v8({0.5662752216, -0.2704613347, -0.1042823146, -0.2414238449, 0, 0, 0, 0}), 1.953125e-06,
+       false, false},
+      {v8({0.5668251667, -0.2706148327, -0.1049394458, -0.2416476455, 0, 0, 0, 0}), 1e-06, false,
        false},
-      {v8({0.7706255308, -0.2490350422, -0.0046568078, -0.3057078719, 0, 0, 0, 0}), 0.0005, false,
+      {v8({0.5668251667, -0.2706148327, -0.1049394458, -0.2416476455, 0, 0, 0, 0}), 1e-06, true,
        false},
-      {v8({0.9543540545, -0.2806615828, -0.2115082814, -0.3889281403, 0, 0, 0, 0}), 0.00025,
-       false, false},
-      {v8({0.9925926785, -0.2686452864, -0.2956448611, -0.4007541347, 0, 0, 0, 0}), 0.000125,
-       false, false},
-      {v8({1.0048132352, -0.2600447590, -0.3334175539, -0.4027952867, 0, 0, 0, 0}), 6.25e-05,
-       false, false},
-      {v8({1.0094735302, -0.2553056419, -0.3513954801, -0.4030724835, 0, 0, 0, 0}), 3.125e-05,
-       false, false},
-      {v8({1.0115463868, -0.2528406947, -0.3602414267, -0.4030587721, 0, 0, 0, 0}), 1.5625e-05,
-       false, false},
-      {v8({1.0125751882, -0.2515825803, -0.3646724817, -0.4030229239, 0, 0, 0, 0}), 7.8125e-06,
-       false, false},
-      {v8({1.0131174732, -0.2509452883, -0.3669126923, -0.4030016305, 0, 0, 0, 0}), 3.90625e-06,
-       false, false},
-      {v8({1.0134109748, -0.2506235928, -0.3680506269, -0.4029920888, 0, 0, 0, 0}), 1.953125e-06,
-       false, false},
-      {v8({1.0135712196, -0.2504614847, -0.3686300345, -0.4029886024, 0, 0, 0, 0}), 1e-06,
-       false, false},
-      {v8({1.0136587689, -0.2503798668, -0.3689254149, -0.4029877028, 0, 0, 0, 0}), 1e-06,
-       false, false},
+      {v8({0.5668251667, -0.2706148327, -0.1049394458, -0.2416476455, 0, 0, 0, 0}), 1e-06, true,
+       false},
   };
 
   ik::RobotModel rm(TEST_URDF_PATH);
@@ -347,11 +353,12 @@ TEST(IkStep, HardRejectedOnlyWhenCollisionCheckerSaysColliding) {
   EXPECT_FALSE(never_colliding.hard_rejected);
 }
 
-TEST(IkStep, SecondaryDqForcesAcceptEvenWithBadRho) {
-  // python golden case: 이 (q, target, damping, alpha) 조합은 secondary_dq가 없으면
-  // rho<=acceptable_ratio라서 반려됨(q 그대로, damping 증가) - secondary_dq!=0이면
-  // rho 판정 자체를 건너뛰고 무조건 채택해야 함(이번 세션에서 고친 phantom damping
-  // 버그와 짝을 이루는 rho-exemption 로직 검증).
+TEST(IkStep, SecondaryDqNoLongerForcesAcceptOnBadRho) {
+  // 이 (q, target, damping, alpha) 조합은 secondary_dq 없이 풀면 rho<=acceptable_ratio라서
+  // 반려됨(q 그대로, damping 증가). 예전엔 secondary_dq!=0이면 rho 판정을 통째로 건너뛰고
+  // 무조건 채택했었는데(phantom damping 버그), 지금은 secondary_dq를 위치 자코비안의
+  // null-space로 투영만 하므로 rho 자체는 secondary_dq 유무와 무관하게 그대로 판정돼야
+  // 함 - 즉 이 케이스는 secondary_dq를 켜도 여전히 반려돼야 함.
   ik::RobotModel rm(TEST_URDF_PATH);
   Eigen::VectorXd q(8);
   q << 1.3468310248132962, -0.11986458207271178, 0.7731865359248742, -0.007731913537142976, 0.0,
@@ -375,22 +382,54 @@ TEST(IkStep, SecondaryDqForcesAcceptEvenWithBadRho) {
   secondary_params.secondary_dq = Eigen::VectorXd::Zero(8);
   secondary_params.secondary_dq[1] = 0.3;
   secondary_params.secondary_gain = 0.01;
-  const ik::IkStepResult accepted = ik::ikStep(rm, target, q, damping, secondary_params);
-  EXPECT_FALSE(accepted.hard_rejected);
-  EXPECT_FALSE(accepted.converged);
-  EXPECT_NEAR(accepted.damping, damping, 1e-9);  // rho 판정을 건너뛰므로 damping 불변
-  bool changed = false;
+  const ik::IkStepResult still_rejected = ik::ikStep(rm, target, q, damping, secondary_params);
+  EXPECT_FALSE(still_rejected.hard_rejected);
+  EXPECT_FALSE(still_rejected.converged);
+  EXPECT_NEAR(still_rejected.damping, damping * reject_params.damping_increase_factor, 1e-9);
   for (int j = 0; j < q.size(); ++j) {
-    if (std::abs(accepted.q[j] - q[j]) > 1e-9) changed = true;
+    EXPECT_DOUBLE_EQ(still_rejected.q[j], q[j]);
   }
-  EXPECT_TRUE(changed);
+}
 
-  Eigen::VectorXd expected(8);
-  expected << 0.7262264189169086, -0.055371226029086326, -0.2529464737185134,
-      -0.19928813112534421, 0.0, 0.0, 0.0, 0.0;
+TEST(IkStep, SecondaryDqIsNullSpaceProjectedAwayFromPosition) {
+  // secondary_dq(예: 그리퍼 방향 정렬)가 위치 자코비안의 null-space로만 투영되므로,
+  // 같은 스텝을 secondary_dq 없이/있이 풀었을 때 최종 EE 위치는 (거의) 그대로여야
+  // 하고, 그 대신 관절 각도 자체는(널스페이스 방향으로) 실제로 달라져야 함.
+  // 하드코딩된 golden 관절값 대신 이 불변식만 검증해서 URDF geometry가 바뀌어도
+  // 안 깨지게 함(RobotModel.LoadsUrdfAndMatchesPythonEePosition 등과의 차이점).
+  ik::RobotModel rm(TEST_URDF_PATH);
+  const Eigen::VectorXd q = Eigen::VectorXd::Zero(rm.model().nq);
+  const double damping = 0.01;
+  const Eigen::Vector3d current_pos = ik::eePosition(rm, q);
+  const Eigen::Vector3d target = current_pos + Eigen::Vector3d(0.001, 0.001, 0.001);
+
+  ik::IkStepParams params;
+  params.tol = 1e-9;
+  params.alpha = 0.5;
+  const ik::IkStepResult without_secondary = ik::ikStep(rm, target, q, damping, params);
+  ASSERT_FALSE(without_secondary.hard_rejected);
+
+  ik::IkStepParams secondary_params = params;
+  secondary_params.secondary_dq = Eigen::VectorXd::Zero(8);
+  secondary_params.secondary_dq[1] = 0.3;  // left_shoulder_pitch 방향으로 크게 당김
+  secondary_params.secondary_gain = 1.0;   // 실제 운용값(EE 정밀도와 맞먹는 세기)
+  const ik::IkStepResult with_secondary = ik::ikStep(rm, target, q, damping, secondary_params);
+  ASSERT_FALSE(with_secondary.hard_rejected);
+
+  // null-space 투영은 1차 선형근사(damped pinv + pinocchio::integrate의 비선형성)라
+  // 완벽히 0은 아님 - secondary_dq[1]=0.3(rad, 상당히 큰 보정)에 대해 실측 leakage가
+  // ~0.2mm라, 그보다 넉넉한 1mm를 "위치를 흔들지 않는다"의 기준으로 둠(예전 방식은
+  // 이 정도가 아니라 수 cm 단위로 위치가 틀어졌었음 - 정도의 차이가 핵심).
+  const Eigen::Vector3d pos_without = ik::eePosition(rm, without_secondary.q);
+  const Eigen::Vector3d pos_with = ik::eePosition(rm, with_secondary.q);
+  EXPECT_NEAR((pos_without - pos_with).norm(), 0.0, 1e-3)
+      << "secondary_dq가 위치 결과를 흔들면 안 됨 (null-space 투영 실패)";
+
+  bool q_changed = false;
   for (int j = 0; j < q.size(); ++j) {
-    EXPECT_NEAR(accepted.q[j], expected[j], 1e-6) << "joint " << j;
+    if (std::abs(with_secondary.q[j] - without_secondary.q[j]) > 1e-6) q_changed = true;
   }
+  EXPECT_TRUE(q_changed) << "secondary_dq가 관절 각도 자체는 실제로 바꿔야 함";
 }
 
 }  // namespace

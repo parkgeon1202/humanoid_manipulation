@@ -119,16 +119,25 @@ bool ManipulationFSM::is_sequence_complete() const
 //해쉬테이블에 모터 하나씩 등록함
 void ManipulationFSM::set_motor_position(const std::string & motor_id, double position)
 {
+  std::lock_guard<std::mutex> lock(data_mutex_);
   motor_positions_[motor_id] = position;
 }
 void ManipulationFSM::set_motor_velocity(const std::string & motor_id, double velocity)
 {
+  std::lock_guard<std::mutex> lock(data_mutex_);
   motor_velocities_[motor_id] = velocity;
 }
 double ManipulationFSM::motor_position(const std::string & motor_id) const
 {
+  std::lock_guard<std::mutex> lock(data_mutex_);
   auto it = motor_positions_.find(motor_id);
   return it == motor_positions_.end() ? 0.0 : it->second;
+}
+double ManipulationFSM::motor_velocity(const std::string & motor_id) const
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  auto it = motor_velocities_.find(motor_id);
+  return it == motor_velocities_.end() ? 0.0 : it->second;
 }
 void ManipulationFSM::set_motor_goal_position(const std::string & motor_id, double goal_position)
 {
@@ -146,10 +155,36 @@ double ManipulationFSM::motor_goal_position(const std::string & motor_id) const
 
 void ManipulationFSM::update_vision(double x, double y, double z)
 {
+  std::lock_guard<std::mutex> lock(data_mutex_);
   has_pending_vision_ = true;
   vision_x_ = x;
   vision_y_ = y;
   vision_z_ = z;
+}
+
+bool ManipulationFSM::tryCapturePendingVision(Eigen::Vector3d * out)
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  if (!has_pending_vision_) {
+    return false;
+  }
+  *out = Eigen::Vector3d(vision_x_, vision_y_, vision_z_);
+  has_pending_vision_ = false;
+  return true;
+}
+
+void ManipulationFSM::notify_motion_end(bool ended)
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  pending_motion_end_ = ended;
+}
+
+std::optional<bool> ManipulationFSM::take_pending_motion_end()
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  const std::optional<bool> result = pending_motion_end_;
+  pending_motion_end_.reset();
+  return result;
 }
 
 //모션 앉을 때와 일어날 때 모션 번호를 반환하면 fsm 객체에 저장됨
@@ -160,6 +195,9 @@ std::optional<int32_t> ManipulationFSM::entry_motion_number() const
   }
   if (phase_ == Phase::PICK && pick_state_ == PickState::COMPLETE_GRIP) {
     return 74;
+  }
+  if (phase_ == Phase::PICK && pick_state_ == PickState::DONE) {
+    return 75;
   }
   return std::nullopt;
 }
@@ -202,6 +240,9 @@ FsmAction & ManipulationFSM::makeActionSnapshot(bool publish_motor_command, doub
                                                  std::optional<int32_t> play_motion_number,
                                                  bool deactivate_and_notify)
 {
+  if (play_motion_number.has_value()) {
+    motion_in_flight_ = true;
+  }
   action_.publish_motor_command = publish_motor_command;
   action_.profile_velocity = profile_velocity;
   action_.play_motion_number = play_motion_number;
@@ -222,16 +263,30 @@ FsmAction ManipulationFSM::finalize()
   return action_;
 }
 
-// 특정 모터가 목표 위치에 도달하고 속도가 충분히 낮은지 판단.
+// 특정 모터가 목표 위치에 도달하고 속도가 충분히 낮은지 판단. motor_positions_/
+// motor_velocities_는 motor_status 콜백 스레드가 쓰므로 data_mutex_로 짧게 보호.
 bool ManipulationFSM::isSettled(const std::string & motor_id, double target_rad) const
 {
-  auto pos_it = motor_positions_.find(motor_id);
-  auto vel_it = motor_velocities_.find(motor_id);
-  if (pos_it == motor_positions_.end() || vel_it == motor_velocities_.end()) {
+  // 모션 재생 중엔 외부 모션 재생기가 모터를 직접 구동해서 우리가 세팅해둔
+  // target_rad가 더 이상 의미가 없음 - 무조건 미도달로 취급.
+  if (motion_in_flight_) {
     return false;
   }
-  return std::fabs(vel_it->second) < ik_tuning_.settle_velocity_threshold &&
-         std::fabs(pos_it->second - target_rad) < ik_tuning_.settle_position_tolerance_rad;
+
+  double position = 0.0;
+  double velocity = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    auto pos_it = motor_positions_.find(motor_id);
+    auto vel_it = motor_velocities_.find(motor_id);
+    if (pos_it == motor_positions_.end() || vel_it == motor_velocities_.end()) {
+      return false;
+    }
+    position = pos_it->second;
+    velocity = vel_it->second;
+  }
+  return std::fabs(velocity) < ik_tuning_.settle_velocity_threshold &&
+         std::fabs(position - target_rad) < ik_tuning_.settle_position_tolerance_rad;
 }
 
 
@@ -278,48 +333,57 @@ bool ManipulationFSM::checkGripMotorStopped(double motor6_velocity)
 //모션 번호 반환 받으며 현재 상태와 모션 번호 멤버 업데이트 함 SIT일 때 한 번만 호출되는 함수임
 void ManipulationFSM::onActivatedImpl()
 {
-  const std::optional<int32_t> motion =
-    (phase_ == Phase::PICK && pick_state_ == PickState::SIT) ? entry_motion_number() : std::nullopt;
+  // SIT(픽 시퀀스 첫 활성화)뿐 아니라 DONE(픽 끝나고 place 하려고 재활성화된 경우)도
+  // 진입 모션이 있음 - 그 외 상태에서 재활성화되는 경우는 없음(picking 도중엔
+  // deactivate_and_notify가 안 나가므로).
+  const bool plays_entry_motion =
+    phase_ == Phase::PICK && (pick_state_ == PickState::SIT || pick_state_ == PickState::DONE);
+  const std::optional<int32_t> motion = plays_entry_motion ? entry_motion_number() : std::nullopt;
   makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                       /*play_motion_number=*/motion, /*deactivate_and_notify=*/false);
 }
 
-//모터 상태 업데이트 받을 때마다 호출함.  현재 상태 업데이트 받고 그립 성공시에는 상태만 업데이트 후 모션 호출해서 일어나기, 그리고 손 폈다 접
+//  현재 상태 업데이트 받고 그립 성공시에는 상태만 업데이트 후 모션 호출해서 일어나기, 그리고 손 폈다 접
 void ManipulationFSM::onMotorFeedbackImpl() 
 {
   // 그립 정지 판정(PICK 상태에서만 유효).
   if (phase_ == Phase::PICK && pick_state_ == PickState::PICK) {
-    const double grip_velocity =
-      motor_velocities_.count(kGripMotorId) ? motor_velocities_.at(kGripMotorId) : 0.0;
+    const double grip_velocity = motor_velocity(kGripMotorId);
     if (checkGripMotorStopped(grip_velocity)) {
-      // PICK_READY로 되돌아간 경우엔 다음 solve_tick()이 state_changed를 스스로
-      // 감지해서 홈복귀+재캡처를 시작하므로 여기서 더 할 일 없음.
-      const bool completed_grip = pick_state_ == PickState::COMPLETE_GRIP;
-      makeActionSnapshot(/*publish_motor_command=*/completed_grip, /*profile_velocity=*/0.0,
-                          /*play_motion_number=*/completed_grip ? entry_motion_number() : std::nullopt,
-                          /*deactivate_and_notify=*/false);
+      // PICK_READY로 되돌아간 경우, COMPLETE_GRIP으로 전이한 경우 둘 다 다음
+      // solve_tick()이 state_changed를 스스로 감지해서 처리함(PICK_READY는
+      // 홈복귀+재캡처, COMPLETE_GRIP은 왼팔을 홈으로 복귀시키고 settle되면
+      // stepCompleteGripHoming()이 모션(74)을 재생함) - 여기서 더 할 일 없음.
+      makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                          /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
       return;
     }
   }
 
-  // 그립 위글 시퀀스(COMPLETE_GRIP 모션(74) 재생 종료 후 2틱에 걸쳐 kick->restore). 공을 확실히 집기 위해서 손을 잠깐 벌리고 다시 닫음
+  // 그립 위글 시퀀스(COMPLETE_GRIP 모션(74) 재생 종료 후 kick->restore). 공을
+  // 확실히 집기 위해서 손을 잠깐 벌렸다가 다시 닫음 - 각 단계는 고정 틱 수가
+  // 아니라 isSettled()로 실제 도달을 확인한 뒤에만 다음 단계로 넘어감(다른
+  // step*Homing들과 동일한 command-once + settle-poll 패턴).
   if (pending_grip_wiggle_) {
-    const double goal = grip_wiggle_kicked_ ? cached_grip_position_ :
-      ik_tuning_.grip_wiggle_kick_position_rad;
-    set_motor_goal_position(kGripMotorId, goal);
-
     if (!grip_wiggle_kicked_) {
+      set_motor_goal_position(kGripMotorId, ik_tuning_.grip_wiggle_kick_position_rad);
       grip_wiggle_kicked_ = true;
-      makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
-                          /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
-      return;
+    } else if (!grip_wiggle_restore_commanded_) {
+      if (isSettled(kGripMotorId, ik_tuning_.grip_wiggle_kick_position_rad)) {
+        set_motor_goal_position(kGripMotorId, cached_grip_position_);
+        grip_wiggle_restore_commanded_ = true;
+      }
+    } else if (isSettled(kGripMotorId, cached_grip_position_)) {
+      //이제 그리퍼가 실제로 다시 오므려진 걸 확인함
+      pending_grip_wiggle_ = false;
+      grip_wiggle_kicked_ = false;
+      grip_wiggle_restore_commanded_ = false;
+      advance();  // COMPLETE_GRIP -> DONE
+      // 곧바로 deactivate하지 않음 - solveTickImpl()의 stepDoneHoming()이 왼팔을
+      // 한 번 더 home_q로 복귀시키고 settle까지 확인한 뒤에 deactivate함.
     }
-    //이제 그리퍼를 다시 오므림
-    pending_grip_wiggle_ = false;
-    grip_wiggle_kicked_ = false;
-    advance();  // COMPLETE_GRIP -> DONE -> (PLACE/VIRTUAL_PLACE로 곧장 넘어감)
     makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
-                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/true);
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
     return;
   }
 
@@ -331,6 +395,8 @@ void ManipulationFSM::onMotorFeedbackImpl()
 
 void ManipulationFSM::onMotionEndImpl(bool ended)
 {
+  motion_in_flight_ = false;
+
   if (!ended) {
     makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
@@ -354,10 +420,37 @@ void ManipulationFSM::onMotionEndImpl(bool ended)
     return;
   }
 
+  if (phase_ == Phase::PICK && pick_state_ == PickState::DONE) {
+    if (advance()) {  // DONE -> PLACE.VIRTUAL_PLACE
+      for (const auto & id : kLegMotorIds) {
+        set_motor_goal_position(id, motor_position(id));
+      }
+      for (const auto & id : kOtherArmMotorIds) {
+        set_motor_goal_position(id, motor_position(id));
+      }
+      makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+                          /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+      return;
+    }
+    makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
+  }
+
   if (phase_ == Phase::PICK && pick_state_ == PickState::COMPLETE_GRIP) {
     cached_grip_position_ = motor_position(kGripMotorId);
     pending_grip_wiggle_ = true;
     grip_wiggle_kicked_ = false;
+    grip_wiggle_restore_commanded_ = false;
+    for (const auto & id : kLegMotorIds) {
+      set_motor_goal_position(id, motor_position(id));
+    }
+    for (const auto & id : kOtherArmMotorIds) {
+      set_motor_goal_position(id, motor_position(id));
+    }
+    makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
   }
   makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                       /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
@@ -382,7 +475,6 @@ void ManipulationFSM::solveTickImpl()
       if (state_changed) {
         damping_ = ik_tuning_.default_damping;
         stuck_streak_ = 0;
-        torso_kick_index_ = 0;
         kick_settling_ = false;
         ik_converged_ = false;
         gripper_position_ = ik_tuning_.gripper_open_rad;
@@ -393,9 +485,17 @@ void ManipulationFSM::solveTickImpl()
       stepReachableIk(/*opening_gripper=*/false);
       return;
     }
+    if (pick_state_ == PickState::COMPLETE_GRIP) {
+      stepCompleteGripHoming(state_changed);
+      return;
+    }
+    if (pick_state_ == PickState::DONE) {
+      stepDoneHoming(state_changed);
+      return;
+    }
     makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
-    // SIT / COMPLETE_GRIP / DONE: solve_tick에서 할 일 없음.
+    // SIT: solve_tick에서 할 일 없음.
     return;
   }
 
@@ -403,10 +503,11 @@ void ManipulationFSM::solveTickImpl()
     if (state_changed) {
       damping_ = ik_tuning_.default_damping;
       stuck_streak_ = 0;
-      torso_kick_index_ = 0;
       kick_settling_ = false;
       ik_converged_ = false;
       has_captured_target_ = false;
+      place_trajectory_.clear();
+      place_traj_time_ = 0.0;
       // gripper_closed_rad(yaml 설정값)이 아니라 실제로 물건을 집은 위치
       // (cached_grip_position_, COMPLETE_GRIP 모션 종료 시점에 캡처해둔 실측값)에서
       // 열기 시작해야 함 - 물건 두께에 따라 실제 그립 위치는 gripper_closed_rad와 다를 수 있음.
@@ -415,17 +516,34 @@ void ManipulationFSM::solveTickImpl()
       // 없이 비전을 캡처하는 즉시 도달 가능 IK로 들어감("공 놓으면 끝" 요구사항).
     }
     if (!has_captured_target_) {
-      if (!has_pending_vision_) {
+      if (!tryCapturePendingVision(&target_pos_)) {
         makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                             /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
         return;
       }
-      target_pos_ = Eigen::Vector3d(vision_x_, vision_y_, vision_z_);
       has_captured_target_ = true;
-      // 이 값은 이미 소비했으니, 다음 캡처가 새 update_vision() 없이 이 값을
-      // 재사용하지 않도록 리셋함(PICK_READY 캡처와 동일한 이유).
-      has_pending_vision_ = false;
+
+      // 시작점(현재 EE, q_로 FK) -> 정점(장애물 회피, 고정 x/y 튜닝값) -> 목표(비전
+      // 캡처값) 3점 등록. z는 세 점 다 같은 vz를 줘서 시작~목표 전체 구간이 등속
+      // 직선이 되게 함(경계조건이 일치하면 quintic이 정확히 직선으로 퇴화함).
+      const Eigen::Vector3d start_pos = ik::eePosition(robot_model_, q_);
+      const double duration = ik_tuning_.place_traj_duration_sec;
+      const double apex_time = duration / 3.0;  // 시작->정점: duration/3, 정점->목표: 나머지
+      const double vz = (target_pos_.z() - start_pos.z()) / duration;
+
+      place_trajectory_.put_point(
+        0.0, start_pos.x(), start_pos.y(), start_pos.z(),
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+      place_trajectory_.put_point(
+        apex_time, ik_tuning_.place_apex_x, ik_tuning_.place_apex_y,
+        start_pos.z() + vz * apex_time,
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+      place_trajectory_.put_point(
+        duration, target_pos_.x(), target_pos_.y(), target_pos_.z(),
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
     }
+    target_pos_ = place_trajectory_.result(place_traj_time_);
+    place_traj_time_ += ik_tuning_.place_traj_dt_sec;
     stepReachableIk(/*opening_gripper=*/true);
     return;
   }
@@ -437,6 +555,79 @@ void ManipulationFSM::solveTickImpl()
 
   makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                       /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+}
+
+// 그립 성공(COMPLETE_GRIP 진입) 직후: 모션을 바로 재생하지 않고, 먼저 왼팔을
+// home_q로 복귀시켜 전부 settle된 뒤에야 모션(74)을 재생함(집은 자세 그대로
+// 모션을 태우면 팔이 이상한 궤적을 그릴 수 있어서).
+void ManipulationFSM::stepCompleteGripHoming(bool state_changed)
+{
+  if (state_changed) {
+    q_ = ik_tuning_.home_q_full;
+    set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
+    set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
+    set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
+    set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
+  }
+
+  // 모션(74)이 재생 중이면 SIT/DONE 진입 모션과 동일하게 완전히 조용해짐
+  // (publish_motor_command=false) - 모션 재생 중엔 외부 모션 재생기가 이 모터들을
+  // 직접 구동하므로 우리가 계속 home_q 유지 명령을 보내면 충돌할 수 있고, isSettled()가
+  // motion_in_flight_일 때 무조건 false를 주므로 allSettled도 이 시점엔 항상 false.
+  if (motion_in_flight_) {
+    makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
+  }
+
+  const bool settled = allSettled({
+      {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
+      {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
+      {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
+      {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
+    });
+
+  std::optional<int32_t> motion;
+  if (settled) {
+    motion = entry_motion_number();
+  }
+
+  makeActionSnapshot(/*publish_motor_command=*/!settled, /*profile_velocity=*/settled ? 0.0 : 1.0,
+                      /*play_motion_number=*/motion, /*deactivate_and_notify=*/false);
+}
+
+// 그립 위글까지 끝나서 DONE에 진입한 직후: 곧바로 deactivate하지 않고, 왼팔을
+// 한 번 더 home_q로 복귀시켜 전부 settle될 때까지 기다린 뒤에야 deactivate함
+// (stepCompletePlaceHoming()과 동일한 command-once + settle-poll 패턴).
+void ManipulationFSM::stepDoneHoming(bool state_changed)
+{
+  if (state_changed) {
+    q_ = ik_tuning_.home_q_full;
+    set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
+    set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
+    set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
+    set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
+  }
+
+  // DONE 재활성화 시(place 단계 시작) onActivatedImpl()이 모션(75)을 재생하는데,
+  // 그동안에도 이 함수는 매 틱 계속 불림 - 모션 재생 중엔 stepCompleteGripHoming과
+  // 동일한 이유로 완전히 조용해져야 함(publish_motor_command=false).
+  if (motion_in_flight_) {
+    makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
+  }
+
+  const bool settled = allSettled({
+      {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
+      {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
+      {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
+      {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
+    });
+
+  makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+                      /*play_motion_number=*/std::nullopt,
+                      /*deactivate_and_notify=*/settled);
 }
 
 void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
@@ -469,50 +660,43 @@ void ManipulationFSM::stepPickReady(bool state_changed)
     q_ = ik_tuning_.home_q_full;
     damping_ = ik_tuning_.default_damping;
     stuck_streak_ = 0;
-    torso_kick_index_ = 0;
     kick_settling_ = false;
-    has_captured_target_ = false;
-    rotation_commanded_ = false;
-    
+
     set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
     set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
     set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
     set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
-    // 이번 tick은 홈 복귀 명령만 - 캡처/회전은 다음 tick부터.
+    // 이번 tick은 홈 복귀 명령만 - 캡처는 다음 tick부터.
     makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
     return;
   }
 
-  if (!has_captured_target_) {
-    if (!has_pending_vision_) {  // 아직 비전 자체가 없음 - 대기.
-      makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
-                          /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
-      return;
-    }
-    target_pos_ = Eigen::Vector3d(vision_x_, vision_y_, vision_z_);
-    has_captured_target_ = true;
-    // 이 값은 이미 소비했으니, 다음 캡처(예: 나중 VIRTUAL_PLACE나 그립 실패 후 재진입)가
-    // 새 update_vision() 없이 이 오래된 값을 재사용하지 않도록 반드시 리셋함.
-    has_pending_vision_ = false;
-  }
-
-  if (!rotation_commanded_) {
-    q_[ik::kTorsoJointIndex] = ik_tuning_.torso_target_rad;
-    q_[ik::kLeftArmIndices[1]] = ik_tuning_.left_shoulder_roll_target_rad;
-    rotation_commanded_ = true;
-  }
-
-  set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
-  set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
-
-  const bool settled = allSettled({
-      {kTorsoMotorId, ik_tuning_.torso_target_rad},
-      {kLeftShoulderRollMotorId, ik_tuning_.left_shoulder_roll_target_rad},
+  // 홈 자세(팔은 이미 home_q_full로 ready 값, torso_yaw는 그대로)에 실제로
+  // 도달하기 전에는 비전 캡처를 시작하지 않음 - 그립 실패 재시도(PICK ->
+  // PICK_READY)처럼 팔이 이전 시도의 애매한 자세로 멈춰 있었을 수 있는 경우에도,
+  // 항상 홈을 거쳐 깨끗한 자세에서부터 시작하게 하기 위함.
+  const bool home_settled = allSettled({
+      {kTorsoMotorId, ik_tuning_.home_q_full[ik::kTorsoJointIndex]},
+      {kLeftShoulderPitchMotorId, ik_tuning_.home_q_full[ik::kLeftArmIndices[0]]},
+      {kLeftShoulderRollMotorId, ik_tuning_.home_q_full[ik::kLeftArmIndices[1]]},
+      {kLeftElbowMotorId, ik_tuning_.home_q_full[ik::kLeftArmIndices[2]]},
     });
-  if (settled) {
-    advance();  // PICK_READY -> PICK
+  if (!home_settled) {
+    makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
   }
+  if (!tryCapturePendingVision(&target_pos_)) {  // 아직 비전 자체가 없음 - 대기.
+    makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
+  }
+
+  // torso_yaw는 더 이상 미리 고정 각도(예전 torso_target_rad, ~90도)로 돌려두지
+  // 않음 - 팔만 home_q_full의 ready 자세로 돌려둔 채로 바로 도달 가능 IK로
+  // 넘어가서, torso_yaw는 IK가 목표를 향해 필요한 만큼만 자유롭게 돌리게 함.
+  advance();  // PICK_READY -> PICK
   makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
                       /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
 }
@@ -534,9 +718,11 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
         kick_settling_ = false;
       }
     } else {
-      const Eigen::VectorXd secondary_dq = collision_checker_.elbowTorsoAvoidanceDq(
-        q_, ik_tuning_.collision_avoidance_threshold_m, ik_tuning_.collision_avoidance_k_pull);
-      const bool secondary_active = secondary_dq.squaredNorm() > 0.0;
+      // elbowTorsoAvoidanceDq(충돌회피)는 지금 당장은 안 씀 - collision_checker_는
+      // hard 충돌 반려(아래 collision_fn)에는 여전히 쓰이므로 그대로 두고, 여기
+      // secondary_dq는 그리퍼 방향 정렬(top-down 그립) 전용으로만 씀.
+      const Eigen::VectorXd secondary_dq =
+        ik::eeOrientationAlignmentDq(robot_model_, q_, ik_tuning_.orientation_align_k_pull);
 
       ik::IkStepParams params;
       params.tol = ik_tuning_.tol;
@@ -548,7 +734,7 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
       params.joint_weights = ik_tuning_.joint_weights;
       params.joint_weight_scale = ik_tuning_.joint_weight_scale;
       params.secondary_dq = secondary_dq;
-      params.secondary_gain = secondary_active ? ik_tuning_.secondary_gain : 0.0;
+      params.secondary_gain = ik_tuning_.secondary_gain;
       params.trust_region_good_ratio = ik_tuning_.trust_region_good_ratio;
       params.trust_region_acceptable_ratio = ik_tuning_.trust_region_acceptable_ratio;
 
@@ -565,15 +751,20 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
       } else {
         stuck_streak_ = std::max(0, stuck_streak_ - 1);
       }
-      if (stuck_streak_ >= ik_tuning_.stuck_streak_ticks &&
-        !ik_tuning_.torso_kick_offsets.empty())
+      if (stuck_streak_ >= ik_tuning_.stuck_streak_ticks)
       {
-        const double kick =
-          ik_tuning_.torso_kick_offsets[torso_kick_index_ % ik_tuning_.torso_kick_offsets.size()];
-        ++torso_kick_index_;
+        // 고정 후보 목록을 순서대로 대입하던 방식 대신, 목표와 현재 EE의 y 오차
+        // 부호를 보고 현재 torso_yaw에서 +/- torso_kick_step_rad만큼 돌림 - 목표가
+        // 있는 쪽으로 방향을 잡아서 킥하므로 엉뚱한 방향으로 도는 시행착오를 줄임.
+        const Eigen::Vector3d current_ee_pos = ik::eePosition(robot_model_, q_);
+        const double error_y = target_pos_.y() - current_ee_pos.y();
+        const double kick = q_[ik::kTorsoJointIndex] +
+          (error_y < 0.0 ? -ik_tuning_.torso_kick_step_rad : ik_tuning_.torso_kick_step_rad);
         q_ = Eigen::VectorXd::Zero(robot_model_.model().nq);
         q_[ik::kTorsoJointIndex] = kick;
+        q_[ik::kLeftArmIndices[0]] = ik_tuning_.left_shoulder_pitch_kick_rad;
         q_[ik::kLeftArmIndices[1]] = ik_tuning_.left_shoulder_roll_target_rad;
+        q_[ik::kLeftArmIndices[2]] = ik_tuning_.elbow_kick_rad;
         damping_ = ik_tuning_.default_damping;
         stuck_streak_ = 0;
         kick_settling_ = true;
