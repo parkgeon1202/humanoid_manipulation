@@ -173,10 +173,11 @@ TEST(ManipulationFsm, PickReadyBiasesTorsoTowardVisionYOnceArmSettledThenAdvance
 }
 
 TEST(ManipulationFsm, CompleteGripReturnsLeftArmHomeThenPlaysMotionOnceSettled) {
-  // motor id -> home_q_full 기대값(makeTestTuning의 [torso, l_shoulder_pitch,
-  // l_shoulder_roll, l_elbow_pitch] = [0,-2.3,1,1.4]과 동일한 매핑).
+  // motor id -> 기대값. torso("22")는 home_q_full의 값(0.0) 그대로 쓰고, 나머지
+  // 팔 관절은 stepCompleteGripHoming 전용 IkTuning 기본값(complete_grip_*)을 씀 -
+  // home_q_full(PICK_READY용)과는 별개(공을 든 채로 안전하게 들고 있을 자세).
   const std::map<std::string, double> home_by_id = {
-      {"22", 0.0}, {"0", -2.3}, {"2", 1.0}, {"4", 1.4}};
+      {"22", 0.0}, {"0", -2.1981}, {"2", 0.0}, {"4", -1.4}};
 
   auto fsm = makeFsm();
   ASSERT_TRUE(fsm->advance());  // SIT -> PICK_READY

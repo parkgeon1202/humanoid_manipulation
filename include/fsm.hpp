@@ -94,6 +94,12 @@ struct IkTuning
 
   Eigen::VectorXd home_q_full;  // model.nq(8) 크기, PICK_READY 진입 시 복귀할 자세
 
+  // COMPLETE_GRIP 진입 직후(stepCompleteGripHoming) 왼팔을 복귀시킬 자세(rad) -
+  // home_q_full(PICK_READY 전용)과 별개로, 공을 든 채로 안전하게 들고 있을 자세.
+  double complete_grip_left_shoulder_pitch_rad = -2.1981;  // -1.5rad에서 40도 더 굽힘
+  double complete_grip_left_shoulder_roll_rad = 0.0;
+  double complete_grip_elbow_rad = -1.4;
+
   double gripper_open_rad = 0.0;
   double gripper_closed_rad = 0.0;
 

@@ -21,7 +21,7 @@ manipulation_node_cpp:
 
     # COMPLETE_GRIP 모션(74번) 종료 후 그립이 실제로 됐는지 확인차 그립 모터를
     # 살짝 움직이는(kick) 목표각(rad).
-    grip.wiggle_kick_position_rad: 1.0
+    grip.wiggle_kick_position_rad: 0.5
 
     # --- 아래는 구 ik_solve_node.yaml에서 병합됨(ik_solve_node.py가 fsm.cpp로
     # 흡수되면서 별도 프로세스/yaml이 없어짐). 값은 debug_ik_node.yaml에서 이번

@@ -612,6 +612,11 @@ void ManipulationFSM::stepCompleteGripHoming(bool state_changed)
 {
   if (state_changed) {
     q_ = ik_tuning_.home_q_full;
+    // 팔은 home_q_full(PICK_READY용 ready 자세)이 아니라 공을 든 채로 안전하게
+    // 들고 있을 별도 자세로 복귀시킴 - torso_yaw는 home_q_full 값 그대로 씀.
+    q_[ik::kLeftArmIndices[0]] = ik_tuning_.complete_grip_left_shoulder_pitch_rad;
+    q_[ik::kLeftArmIndices[1]] = ik_tuning_.complete_grip_left_shoulder_roll_rad;
+    q_[ik::kLeftArmIndices[2]] = ik_tuning_.complete_grip_elbow_rad;
     set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
     set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
     set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
