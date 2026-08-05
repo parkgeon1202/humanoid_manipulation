@@ -85,29 +85,38 @@ struct IkTuning
   int stuck_streak_ticks = 30;
   // 정체 킥 때 팔꿈치를 펴둔 채로(0.0) 두면 다리/공을 치는 경우가 있어서, torso_yaw
   // 킥과 함께 팔꿈치도 이 각도(rad)만큼 굽혀서 리셋함.
-  double elbow_kick_rad = 1.4;
+  double elbow_kick_rad = 0.0;
   // torso_yaw 킥 크기(rad). 정체 시 목표와 현재 EE의 y 오차 부호를 보고 현재
   // torso_yaw에서 이 값만큼 +/- 방향으로 돌림(stepReachableIk 참고).
   double torso_kick_step_rad = 0.5;
   // 위와 동일한 이유로 어깨 pitch도 0.0 대신 이 각도(rad)로 리셋함.
-  double left_shoulder_pitch_kick_rad = -2.3;
+  double left_shoulder_pitch_kick_rad = -2.7;
 
   Eigen::VectorXd home_q_full;  // model.nq(8) 크기, PICK_READY 진입 시 복귀할 자세
 
   double gripper_open_rad = 0.0;
   double gripper_closed_rad = 0.0;
-  double gripper_step_rad = 0.0;
 
   // 정체 킥 때 어깨 롤을 이 각도로 리셋함(elbow_kick_rad/left_shoulder_pitch_kick_rad와
-  // 짝, kick 전용 - PICK_READY는 더 이상 torso_yaw를 미리 고정 회전시키지 않음).
-  double left_shoulder_roll_target_rad = 1.0;
-  double settle_velocity_threshold = 0.3;  // CurrentMotorStatus.velocity는 raw uint8 단위
+  // 짝, kick 전용).
+  double left_shoulder_roll_target_rad = 0.3;
+
+  // PICK_READY 진입 시 torso_yaw를 고정 프리셋(home_q_full) 대신 비전 y 부호로
+  // 미리 그쪽으로 기울여두는 크기(rad) - stepPickReady 참고. y가 오른쪽(음수)이면
+  // -이 값, 왼쪽(양수)이면 +이 값으로 씀.
+  double pick_ready_torso_bias_rad = 1.0;
+
+  double settle_velocity_threshold = 0.3;  // CurrentMotorStatus.velocity는 rad/s 단위
   double settle_position_tolerance_rad = 0.05;
 
   // 그립 모터(6번) 정지 판정(main_node.yaml의 grip.* 그대로).
-  double grip_moving_velocity_threshold = 0.3;
-  double grip_near_zero_position_threshold = 0.2;
+  double grip_moving_velocity_threshold = 0.5;
+  double grip_near_zero_position_threshold = 0.1;
   double grip_wiggle_kick_position_rad = 1.0;
+  // velocity가 threshold 밑으로 이 tick 수만큼 연속으로 유지돼야 "진짜 멈췄다"로
+  // 확정함(1틱만 보고 확정하면 정지 마찰/토크 리플 같은 순간적인 속도 저하를
+  // 오탐해서 훨씬 덜 오므린 채로 그립 완료 처리되는 문제가 있었음).
+  int grip_stopped_streak_ticks = 10;
 
   // COMPLETE_PLACE 홈잉 정지 판정(main_node.yaml의 arm.settled_velocity_threshold 그대로).
   double arm_settled_velocity_threshold = 0.3;
@@ -123,6 +132,10 @@ struct IkTuning
   double place_apex_x = 0.1;
   double place_apex_y = 0.3;
   double place_traj_duration_sec = 3.0;  // 시작->정점->목표 전체 소요 시간(초)
+
+  // 비전 y값의 실측 오프셋(m) - PICK_READY의 torso_yaw 편향 방향 결정 시
+  // target_pos_.y()에서 이 값을 뺀 보정값(corrected_y)을 씀(stepPickReady 참고).
+  double vision_y_offset = 0.0328;
 };
 
 class ManipulationFSM
@@ -245,6 +258,10 @@ private:
   // 대기 중인 값이 있으면 *out에 채우고 pending 플래그를 지운 뒤 true, 없으면 false.
   bool tryCapturePendingVision(Eigen::Vector3d * out);
 
+  // PICK_READY state_changed 시점처럼, 이전 시도 중에 받아둔 낡은 비전 값을 이번
+  // 시도의 캡처값으로 쓰지 않게 미리 버림(data_mutex_로 보호).
+  void discardPendingVision();
+
   bool checkGripMotorStopped(double motor6_velocity);
   // 모터 하나가 목표 위치(rad)에 도달했는지(위치+속도 둘 다 임계값 안) 판정하는
   // 유일한 통로 - 회전 settle/COMPLETE_PLACE 홈잉 settle이 전부 이걸 통해서만 판정함.
@@ -274,6 +291,7 @@ private:
   std::unordered_map<std::string, double> motor_velocities_;
   std::unordered_map<std::string, double> motor_goal_positions_;
   bool grip_motor_was_moving_ = false;
+  int grip_stopped_streak_ = 0;
 
   bool has_pending_vision_ = false;
   double vision_x_ = 0.0;
@@ -293,6 +311,10 @@ private:
   double damping_ = ik::kDefaultDamping;
   Eigen::Vector3d target_pos_ = Eigen::Vector3d::Zero();
   bool has_captured_target_ = false;
+  // stepPickReady 전용: 팔이 home_q_full ready 자세에 settle되고 비전도 캡처된
+  // 뒤에야 torso_yaw 편향(+-pick_ready_torso_bias_rad) 명령을 한 번 내보내고
+  // true로 세팅 - 그 뒤로는 torso가 그 값에 실제로 도달했는지만 확인함.
+  bool torso_bias_commanded_ = false;
 
   // VIRTUAL_PLACE 전용: target_pos_를 매 틱 이 궤적의 result(place_traj_time_)로 갱신해서
   // 기존 ikStep 루프에 그대로 흘려보냄(경유점은 stepReachableIk 진입 전에 구성).

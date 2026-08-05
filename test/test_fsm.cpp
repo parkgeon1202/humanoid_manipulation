@@ -21,12 +21,11 @@ IkTuning makeTestTuning() {
   tuning.torso_kick_step_rad = 0.5;
   tuning.gripper_open_rad = 0.5;
   tuning.gripper_closed_rad = 0.0;
-  tuning.gripper_step_rad = 0.02;
   tuning.left_shoulder_roll_target_rad = 1.0;
   tuning.settle_velocity_threshold = 0.3;
   tuning.settle_position_tolerance_rad = 0.05;
-  tuning.grip_moving_velocity_threshold = 0.3;
-  tuning.grip_near_zero_position_threshold = 0.2;
+  tuning.grip_moving_velocity_threshold = 0.5;
+  tuning.grip_near_zero_position_threshold = 0.1;
   tuning.grip_wiggle_kick_position_rad = 1.0;
 
   // 실제 yaml 기본값(pick_ready_home_q: [0, -2.3, 1, 1.4])과 동일하게 맞춤 - PICK_READY가
@@ -105,44 +104,27 @@ TEST(ManipulationFsm, MotionEndAdvancesDoneToVirtualPlaceAndLatchesLegsAndOtherA
   EXPECT_NEAR(action.motor_goal_positions.at("1"), -0.17, 1e-9);
 }
 
-TEST(ManipulationFsm, PickReadyHomeResetsThenCapturesVisionOnceThenAdvancesImmediately) {
+TEST(ManipulationFsm, PickReadySendsArmGoalImmediatelyThenWaitsArmSettleAndVision) {
   auto fsm = makeFsm();
   fsm->on_motion_end(true);  // SIT -> PICK_READY
 
-  // 홈(torso=0, 왼팔은 이미 ready 자세: -2.3,1,1.4) 자세에 이미 도달해 있다고 피드백
-  // - 비전 캡처는 이 4개 관절이 전부 settle된 뒤에만 시작되므로(그립 실패 재시도
-  // 시 이전 자세가 남아있지 않게), 이 피드백 없이는 tick3에서 캡처가 안 됨.
-  fsm->set_motor_position("22", 0.0);
-  fsm->set_motor_velocity("22", 0.0);
-  fsm->set_motor_position("0", -2.3);
-  fsm->set_motor_velocity("0", 0.0);
-  fsm->set_motor_position("2", 1.0);
-  fsm->set_motor_velocity("2", 0.0);
-  fsm->set_motor_position("4", 1.4);
-  fsm->set_motor_velocity("4", 0.0);
-
-  // 첫 tick: 홈 복귀 명령만 나가고 아직 비전 캡처 전.
+  // 1단계: state_changed 틱은 비전 여부와 무관하게 팔(shoulder_pitch/roll/elbow)
+  // ready 자세 명령을 바로 내보냄 - torso_yaw는 아직 안 건드림.
   const FsmAction tick1 = fsm->solve_tick();
   ASSERT_TRUE(tick1.publish_motor_command);
-  EXPECT_NEAR(tick1.motor_goal_positions.at("22"), 0.0, 1e-9);
-  EXPECT_NEAR(tick1.motor_goal_positions.at("0"), -2.3, 1e-9);
   EXPECT_EQ(tick1.state_string, "PICK.PICK_READY");
+  EXPECT_NEAR(tick1.motor_goal_positions.at("0"), -2.3, 1e-9);
+  EXPECT_NEAR(tick1.motor_goal_positions.at("2"), 1.0, 1e-9);
+  EXPECT_NEAR(tick1.motor_goal_positions.at("4"), 1.4, 1e-9);
 
-  // 비전이 아직 없으면 캡처도 전이도 안 함(publish 여부만 확인).
-  const FsmAction tick2 = fsm->solve_tick();
-  EXPECT_FALSE(tick2.publish_motor_command);
+  // 팔이 아직 ready 자세에 도달하지 않았으면(속도 남아있음) 계속 대기.
+  fsm->set_motor_position("0", -1.8);
+  fsm->set_motor_velocity("0", 50.0);
+  const FsmAction still_moving = fsm->solve_tick();
+  EXPECT_EQ(still_moving.state_string, "PICK.PICK_READY");
 
-  // 비전이 들어오면 그 순간 값을 캡처하고, torso_yaw를 미리 고정 회전시키는 단계
-  // 없이(예전엔 -1.5rad로 돌리고 settle을 기다렸음) 바로 PICK(도달 가능 IK)로
-  // 전이함 - 팔은 이미 home_q_full로 ready 자세라 더 돌 필요가 없음.
-  fsm->update_vision(0.05, 0.15, -0.15);
-  const FsmAction tick3 = fsm->solve_tick();
-  EXPECT_EQ(tick3.state_string, "PICK.PICK");
-}
-
-TEST(ManipulationFsm, PickPreservesHomeArmPoseWithUnrotatedTorsoAsIkStartingPoint) {
-  auto fsm = makeFsm();
-  fsm->on_motion_end(true);
+  // 팔(+ torso도 아직 안 건드렸으므로 home_q_full 프리셋과 동일한 위치)이 전부
+  // settle됐다고 피드백해도, 비전이 아직 없으면 조용히 대기(publish 없음).
   fsm->set_motor_position("22", 0.0);
   fsm->set_motor_velocity("22", 0.0);
   fsm->set_motor_position("0", -2.3);
@@ -151,18 +133,43 @@ TEST(ManipulationFsm, PickPreservesHomeArmPoseWithUnrotatedTorsoAsIkStartingPoin
   fsm->set_motor_velocity("2", 0.0);
   fsm->set_motor_position("4", 1.4);
   fsm->set_motor_velocity("4", 0.0);
-  fsm->solve_tick();  // 홈 복귀
+  const FsmAction waiting_for_vision = fsm->solve_tick();
+  EXPECT_FALSE(waiting_for_vision.publish_motor_command);
+  EXPECT_EQ(waiting_for_vision.state_string, "PICK.PICK_READY");
+}
 
+TEST(ManipulationFsm, PickReadyBiasesTorsoTowardVisionYOnceArmSettledThenAdvancesOnceTorsoSettled) {
+  auto fsm = makeFsm();
+  fsm->on_motion_end(true);
+  fsm->solve_tick();  // state_changed: 팔 ready 명령만 나감
+
+  // 팔이 ready 자세에 도달했다고 피드백.
+  fsm->set_motor_position("22", 0.0);
+  fsm->set_motor_velocity("22", 0.0);
+  fsm->set_motor_position("0", -2.3);
+  fsm->set_motor_velocity("0", 0.0);
+  fsm->set_motor_position("2", 1.0);
+  fsm->set_motor_velocity("2", 0.0);
+  fsm->set_motor_position("4", 1.4);
+  fsm->set_motor_velocity("4", 0.0);
+
+  // 팔 settle이 확인된 뒤에야 비전 캡처가 실제로 쓰임 - y가 양수(왼쪽)이므로
+  // torso_yaw를 +pick_ready_torso_bias_rad(기본 1.0)로 명령해야 함.
   fsm->update_vision(0.05, 0.15, -0.15);
-  const FsmAction entered_pick = fsm->solve_tick();  // 캡처 + 바로 PICK 전이
-  ASSERT_EQ(entered_pick.state_string, "PICK.PICK");
+  const FsmAction torso_commanded = fsm->solve_tick();
+  ASSERT_TRUE(torso_commanded.publish_motor_command);
+  EXPECT_EQ(torso_commanded.state_string, "PICK.PICK_READY");  // 아직 PICK 아님
+  EXPECT_NEAR(torso_commanded.motor_goal_positions.at("22"), 1.0, 1e-9);
 
-  // PICK 진입 직후 첫 IK tick: q_가 0으로 리셋되지 않고 home_q_full(팔은 ready
-  // 값, torso_yaw=0)에서 그대로 시작함 - torso_yaw를 미리 돌려두지 않았으므로
-  // 한 스텝만으로 크게 안 움직여야 함(예전엔 -1.5rad 근처에서 시작해서 -1.0
-  // 이하였음 - 이제는 0 근처에서 시작).
-  ASSERT_TRUE(entered_pick.publish_motor_command);
-  EXPECT_NEAR(entered_pick.motor_goal_positions.at("22"), 0.0, 0.5);
+  // torso가 아직 그 값에 도달하지 않았으면 PICK_READY에 계속 머무름.
+  const FsmAction torso_still_moving = fsm->solve_tick();
+  EXPECT_EQ(torso_still_moving.state_string, "PICK.PICK_READY");
+
+  // torso가 실제로 편향값(1.0)에 도달했다고 피드백하면 그제서야 PICK으로 전이.
+  fsm->set_motor_position("22", 1.0);
+  fsm->set_motor_velocity("22", 0.0);
+  const FsmAction entered_pick = fsm->solve_tick();
+  EXPECT_EQ(entered_pick.state_string, "PICK.PICK");
 }
 
 TEST(ManipulationFsm, CompleteGripReturnsLeftArmHomeThenPlaysMotionOnceSettled) {
@@ -209,10 +216,9 @@ TEST(ManipulationFsm, CompleteGripReturnsLeftArmHomeThenPlaysMotionOnceSettled) 
 }
 
 TEST(ManipulationFsm, DoneHomesLeftArmOnceThenWaitsForSettleBeforeDeactivating) {
-  // motor id -> home_q_full 기대값(makeTestTuning의 [torso, l_shoulder_pitch,
-  // l_shoulder_roll, l_elbow_pitch] = [0,-2.3,1,1.4]과 동일한 매핑).
+  // stepDoneHoming()은 home_q_full이 아니라 항상 0.0으로 복귀시킴(motor id -> 0.0).
   const std::map<std::string, double> home_by_id = {
-      {"22", 0.0}, {"0", -2.3}, {"2", 1.0}, {"4", 1.4}};
+      {"22", 0.0}, {"0", 0.0}, {"2", 0.0}, {"4", 0.0}};
 
   auto fsm = makeFsm();
   ASSERT_TRUE(fsm->advance());  // SIT -> PICK_READY

@@ -198,16 +198,14 @@ class DebugIkNode : public rclcpp::Node {
     trust_region_acceptable_ratio_ = declare_parameter<double>(
         "ik.trust_region_acceptable_ratio", ik::kTrustRegionAcceptableRatio);
     const double gripper_open_deg = declare_parameter<double>("gripper.open_deg", 30.0);
-    const double gripper_closed_deg = declare_parameter<double>("gripper.closed_deg", 0.0);
-    const double gripper_step_deg = declare_parameter<double>("gripper.step_deg", 0.6);
+    const double gripper_closed_deg = declare_parameter<double>("gripper.closed_deg", -36.7033);
     gripper_open_rad_ = gripper_open_deg * M_PI / 180.0;
     gripper_closed_rad_ = gripper_closed_deg * M_PI / 180.0;
-    gripper_step_rad_ = gripper_step_deg * M_PI / 180.0;
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 main_node.yaml의 ik.left_shoulder_roll_target_rad와
-    // 동일하게 1.0.
+    // 동일하게 0.3.
     const std::vector<double> home_q = declare_parameter<std::vector<double>>(
-        "pick_ready_home_q", std::vector<double>{0.0, -2.3, 1.0, 1.4});
+        "pick_ready_home_q", std::vector<double>{0.0, -2.7, 0.3, 0.0});
     home_profile_velocity_ = declare_parameter<double>("profile_velocity", 1.0);
     const std::vector<double> joint_weights_4 = declare_parameter<std::vector<double>>(
         "ik.joint_weights", std::vector<double>{1.0, 1.0, 1.0, 1.0});
@@ -223,17 +221,25 @@ class DebugIkNode : public rclcpp::Node {
     torso_kick_step_rad_ = declare_parameter<double>("ik.torso_kick_step_rad", 0.5);
     // 정체 킥 때 팔꿈치를 펴둔 채로(0.0) 두면 다리/공을 치는 경우가 있어서, torso_yaw
     // 킥과 함께 팔꿈치도 이 각도(rad)만큼 굽혀서 리셋함(fsm.cpp의 elbow_kick_rad와 동일).
-    elbow_kick_rad_ = declare_parameter<double>("ik.elbow_kick_rad", 1.4);
+    elbow_kick_rad_ = declare_parameter<double>("ik.elbow_kick_rad", 0.0);
     // 위와 동일한 이유로 어깨 pitch도 0.0 대신 이 각도(rad)로 리셋함(fsm.cpp의
     // left_shoulder_pitch_kick_rad와 동일).
     left_shoulder_pitch_kick_rad_ =
-        declare_parameter<double>("ik.left_shoulder_pitch_kick_rad", -2.3);
+        declare_parameter<double>("ik.left_shoulder_pitch_kick_rad", -2.7);
+    // fsm.cpp의 stepPickReady/ik_tuning_.pick_ready_torso_bias_rad와 동일 - torso_yaw를
+    // 더 이상 현재 물리 위치에 고정하지 않고, target_pos_의 y 부호로 이 크기(rad)만큼
+    // 미리 그쪽으로 기울여둠(consumePendingKey 참고).
+    pick_ready_torso_bias_rad_ =
+        declare_parameter<double>("ik.pick_ready_torso_bias_rad", 1.0);
+    // fsm.cpp의 ik_tuning_.vision_y_offset과 동일 - target_pos_.y()에서 이 값을
+    // 빼서 비전 y의 실측 오프셋을 보정함(consumePendingKey 참고).
+    vision_y_offset_ = declare_parameter<double>("ik.vision_y_offset", 0.0328);
 
     // kRotatingArm(팔 회전) 전용 도달 판정. 모터 속도가 torso_settle_velocity_threshold
     // 미만이고 동시에 목표와의 위치 차이가 torso_settle_position_tolerance_rad(rad)
     // 이내면 "도달"로 보고 도달 가능 IK로 자동 전환함. 속도만 보면 명령 직후(아직
     // 움직이기 전) 첫 틱에 오판할 수 있어서 위치 조건을 반드시 같이 봄.
-    // CurrentMotorStatus.velocity는 rad/s가 아니라 raw uint8 단위라,
+    // CurrentMotorStatus.velocity는 rad/s 단위이고,
     // debug_node.cpp의 arm_settled_velocity_threshold 기본값(0.3)과 동일한
     // 스케일을 그대로 씀.
     torso_settle_velocity_threshold_ =
@@ -297,6 +303,8 @@ class DebugIkNode : public rclcpp::Node {
     } else if (key == 's' && target.has_value()) {
       mode_.store(Mode::kRotatingArm);
       target_pos_ = *target;
+      // 비전 y의 실측 오프셋을 캡처 시점에 바로 보정(fsm.cpp의 stepPickReady와 동일).
+      target_pos_.y() -= vision_y_offset_;
       ik_converged_ = false;
       damping_ = default_damping_;
       stuck_streak_ = 0;
@@ -304,20 +312,20 @@ class DebugIkNode : public rclcpp::Node {
       done_printed_ = false;
       gripper_position_ = gripper_open_rad_;
       frozen_motor_positions_ = motor_positions_;
-      // kRotatingArm: 팔(shoulder_pitch/roll/elbow)만 먼저 돌리고, 허리는 이번
-      // tick의 현재 위치에 그대로 고정 명령해서 안 움직이게 함. torso_yaw는 더
-      // 이상 미리 고정 각도(예전 torso_target_rad_, ~90도)로 돌려두지 않음 - 팔이
-      // settle되면(stepRotatingArm) 바로 도달 가능 IK로 넘어가서, torso_yaw는
-      // IK가 목표를 향해 필요한 만큼만 자유롭게 돌리게 함. shoulder_pitch/elbow도
-      // 킥/home과 동일하게 굽혀서 시작해야 다리/공을 안 침(elbow_kick_rad_,
-      // left_shoulder_pitch_kick_rad_ 참고).
-      q_ = Eigen::VectorXd::Zero(rm_.model().nq);
+      torso_bias_commanded_ = false;
+      // 1단계: 팔(shoulder_pitch/roll/elbow)만 먼저 home_q_full_(=pick_ready_home_q,
+      // 'a'키가 쓰는 것과 동일한 ready 자세)로 돌림 - torso_yaw는 아직 안 건드리고
+      // 지금 위치에 그대로 고정(freeze). 팔이 settle된 뒤에야(stepRotatingArm)
+      // target_pos_의 y 부호를 보고 torso 방향을 정해서 명령하고, 그것까지 settle된
+      // 뒤에야 도달 가능 IK로 넘어감(순차 2단계 - fsm.cpp의 stepPickReady와 동일한
+      // 구조).
+      q_ = home_q_full_;
       const std::string& torso_motor_id = kQIndexToMotorId.at(ik::kTorsoJointIndex);
       const auto torso_it = frozen_motor_positions_.find(torso_motor_id);
       q_[ik::kTorsoJointIndex] = (torso_it != frozen_motor_positions_.end()) ? torso_it->second : 0.0;
-      q_[ik::kLeftArmIndices[0]] = left_shoulder_pitch_kick_rad_;
-      q_[ik::kLeftArmIndices[1]] = 1.0;
-      q_[ik::kLeftArmIndices[2]] = elbow_kick_rad_;
+      std::printf(
+        "[pick_ik_debug] captured target=(%.4f, %.4f, %.4f) q_torso_seed=%.4f\n",
+        target_pos_.x(), target_pos_.y(), target_pos_.z(), q_[ik::kTorsoJointIndex]);
       RCLCPP_INFO(get_logger(), "팔 회전 시작(허리는 현재 위치 유지).");
     }
   }
@@ -334,12 +342,29 @@ class DebugIkNode : public rclcpp::Node {
 
   void stepRotatingArm() {
     // 실제 이동은 모터 자체의 profile_velocity 기반 궤적 생성이 담당함(다른
-    // 모드들과 동일 패턴) - q_가 이미 이번 단계의 목표(팔은 킥값, 허리는 현재
-    // 위치 유지)로 채워져 있으므로 armMotorsSettledToQ()를 그대로 재사용.
+    // 모드들과 동일 패턴) - armMotorsSettledToQ()를 두 단계 모두에서 재사용.
+    if (!torso_bias_commanded_) {
+      // 1단계: 팔(+ 아직 안 건드린 torso, 현재 위치에 고정된 값이라 사실상 항상
+      // 만족)이 home_q_full_ ready 자세에 실제로 도달했는지 확인.
+      if (armMotorsSettledToQ()) {
+        // 팔 settle이 확인된 뒤에야 target_pos_의 y 부호로 torso 방향을 정해서
+        // 명령 - publishArm 전에 갱신해야 이번 tick부터 바로 새 목표로 나감.
+        q_[ik::kTorsoJointIndex] =
+            (target_pos_.y() >= 0.0) ? pick_ready_torso_bias_rad_ : -pick_ready_torso_bias_rad_;
+        torso_bias_commanded_ = true;
+        RCLCPP_INFO(get_logger(), "팔 회전 완료 -> torso_yaw=%.2frad로 회전.",
+                    q_[ik::kTorsoJointIndex]);
+      }
+      publishArm(home_profile_velocity_);
+      return;
+    }
+
+    // 2단계: torso_yaw가 실제로 그 방향값까지 도달했는지 확인한 뒤에야 도달 가능
+    // IK로 넘어감.
     publishArm(home_profile_velocity_);
     if (armMotorsSettledToQ()) {
       mode_.store(Mode::kReachable);
-      RCLCPP_INFO(get_logger(), "팔 회전 완료 -> 도달 가능 IK 시작.");
+      RCLCPP_INFO(get_logger(), "팔+허리 회전 완료 -> 도달 가능 IK 시작.");
     }
   }
 
@@ -419,7 +444,7 @@ class DebugIkNode : public rclcpp::Node {
         q_ = Eigen::VectorXd::Zero(rm_.model().nq);
         q_[ik::kTorsoJointIndex] = kick;
         q_[ik::kLeftArmIndices[0]] = left_shoulder_pitch_kick_rad_;
-        q_[ik::kLeftArmIndices[1]] = 1.0;
+        q_[ik::kLeftArmIndices[1]] = 0.3;
         q_[ik::kLeftArmIndices[2]] = elbow_kick_rad_;
         damping_ = default_damping_;
         stuck_streak_ = 0;
@@ -431,13 +456,24 @@ class DebugIkNode : public rclcpp::Node {
 
       if (result.converged) {
         ik_converged_ = true;
+        const Eigen::Vector3d converged_ee = ik::eePosition(rm_, q_);
+        std::printf(
+          "[pick_ik_debug] target=(%.4f, %.4f, %.4f) converged_ee=(%.4f, %.4f, %.4f) "
+          "diff=(%.4f, %.4f, %.4f) q_torso=%.4f\n",
+          target_pos_.x(), target_pos_.y(), target_pos_.z(),
+          converged_ee.x(), converged_ee.y(), converged_ee.z(),
+          converged_ee.x() - target_pos_.x(), converged_ee.y() - target_pos_.y(),
+          converged_ee.z() - target_pos_.z(), q_[ik::kTorsoJointIndex]);
         RCLCPP_INFO(get_logger(), "reachable IK converged, 그립 시작.");
       }
     } else {
-      gripper_position_ = std::max(gripper_closed_rad_, gripper_position_ - gripper_step_rad_);
-      if (gripper_position_ <= gripper_closed_rad_ && !done_printed_) {
+      // 매 tick 목표를 조금씩(step) 당기지 않고, 닫힘 목표를 한 번에 그대로 명령함
+      // - 실제 이동 속도/궤적은 모터 자체의 profile_velocity(home_profile_velocity_,
+      // 기본 1.0)가 담당(다른 관절과 동일 패턴).
+      gripper_position_ = gripper_closed_rad_;
+      if (!done_printed_) {
         done_printed_ = true;
-        RCLCPP_INFO(get_logger(), "푸는 거 다 끝났음.");
+        RCLCPP_INFO(get_logger(), "그립 목표 위치 명령함.");
       }
     }
     publishArm(home_profile_velocity_);
@@ -536,7 +572,6 @@ class DebugIkNode : public rclcpp::Node {
   double trust_region_acceptable_ratio_ = ik::kTrustRegionAcceptableRatio;
   double gripper_open_rad_ = 0.0;
   double gripper_closed_rad_ = 0.0;
-  double gripper_step_rad_ = 0.0;
   double home_profile_velocity_ = 1.0;
   double secondary_gain_ = 1.0;
   double orientation_align_k_pull_ = 1.0;
@@ -544,8 +579,10 @@ class DebugIkNode : public rclcpp::Node {
   double collision_avoidance_k_pull_ = 1.0;
   int stuck_streak_ticks_ = 30;
   double torso_kick_step_rad_ = 0.5;
-  double elbow_kick_rad_ = 1.4;
-  double left_shoulder_pitch_kick_rad_ = -2.3;
+  double elbow_kick_rad_ = 0.0;
+  double left_shoulder_pitch_kick_rad_ = -2.7;
+  double pick_ready_torso_bias_rad_ = 1.0;
+  double vision_y_offset_ = 0.0328;
   Eigen::VectorXd joint_weights_;
   double joint_weight_scale_ = 0.0;
   Eigen::VectorXd home_q_full_;
@@ -581,6 +618,10 @@ class DebugIkNode : public rclcpp::Node {
   int stuck_streak_ = 0;
   bool kick_settling_ = false;
   bool done_printed_ = false;
+  // stepRotatingArm 전용: 팔이 home_q_full_ ready 자세에 settle되고 나서야
+  // torso_yaw 방향(+-pick_ready_torso_bias_rad_) 명령을 한 번 내보내고 true로
+  // 세팅 - 그 뒤로는 torso가 그 값에 실제로 도달했는지만 확인함.
+  bool torso_bias_commanded_ = false;
 };
 
 namespace {

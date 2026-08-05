@@ -164,16 +164,14 @@ private:
       "ik.trust_region_acceptable_ratio", ik::kTrustRegionAcceptableRatio);
 
     const double gripper_open_deg = declare_parameter<double>("gripper.open_deg", 30.0);
-    const double gripper_closed_deg = declare_parameter<double>("gripper.closed_deg", 0.0);
-    const double gripper_step_deg = declare_parameter<double>("gripper.step_deg", 0.6);
+    const double gripper_closed_deg = declare_parameter<double>("gripper.closed_deg", -36.7033);
     tuning.gripper_open_rad = gripper_open_deg * M_PI / 180.0;
     tuning.gripper_closed_rad = gripper_closed_deg * M_PI / 180.0;
-    tuning.gripper_step_rad = gripper_step_deg * M_PI / 180.0;
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
-    // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 1.0.
+    // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.
     const std::vector<double> home_q = declare_parameter<std::vector<double>>(
-      "pick_ready_home_q", std::vector<double>{0.0, -2.3, 1.0, 1.4});
+      "pick_ready_home_q", std::vector<double>{0.0, -2.7, 0.3, 0.0});
     const std::vector<double> joint_weights_4 = declare_parameter<std::vector<double>>(
       "ik.joint_weights", std::vector<double>{1.0, 1.0, 1.0, 1.0});
     tuning.joint_weight_scale = declare_parameter<double>("ik.joint_weight_scale", 0.0);
@@ -186,23 +184,28 @@ private:
       declare_parameter<double>("ik.collision_avoidance_k_pull", 1.0);
     tuning.stuck_streak_ticks = declare_parameter<int>("ik.stuck_streak_ticks", 30);
     tuning.torso_kick_step_rad = declare_parameter<double>("ik.torso_kick_step_rad", 0.5);
-    tuning.elbow_kick_rad = declare_parameter<double>("ik.elbow_kick_rad", 1.4);
+    tuning.elbow_kick_rad = declare_parameter<double>("ik.elbow_kick_rad", 0.0);
     tuning.left_shoulder_pitch_kick_rad =
-      declare_parameter<double>("ik.left_shoulder_pitch_kick_rad", -2.3);
+      declare_parameter<double>("ik.left_shoulder_pitch_kick_rad", -2.7);
 
     tuning.left_shoulder_roll_target_rad =
-      declare_parameter<double>("ik.left_shoulder_roll_target_rad", 1.0);
+      declare_parameter<double>("ik.left_shoulder_roll_target_rad", 0.3);
+    tuning.pick_ready_torso_bias_rad =
+      declare_parameter<double>("ik.pick_ready_torso_bias_rad", 1.0);
+    tuning.vision_y_offset = declare_parameter<double>("ik.vision_y_offset", 0.0328);
     tuning.settle_velocity_threshold =
       declare_parameter<double>("ik.torso_settle_velocity_threshold", 0.3);
     tuning.settle_position_tolerance_rad =
       declare_parameter<double>("ik.torso_settle_position_tolerance_rad", 0.05);
 
     tuning.grip_moving_velocity_threshold =
-      declare_parameter<double>("grip.moving_velocity_threshold", 0.3);
+      declare_parameter<double>("grip.moving_velocity_threshold", 0.5);
     tuning.grip_near_zero_position_threshold =
-      declare_parameter<double>("grip.near_zero_position_threshold", 0.2);
+      declare_parameter<double>("grip.near_zero_position_threshold", 0.1);
     tuning.grip_wiggle_kick_position_rad =
       declare_parameter<double>("grip.wiggle_kick_position_rad", 1.0);
+    tuning.grip_stopped_streak_ticks =
+      declare_parameter<int>("grip.stopped_streak_ticks", 10);
 
     const int nq = 8;
     tuning.home_q_full = Eigen::VectorXd::Zero(nq);

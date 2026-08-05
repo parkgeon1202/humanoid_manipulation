@@ -83,7 +83,18 @@ ament_target_dependencies(debug_ik_node
   ament_index_cpp
 )
 
-install(TARGETS main_node debug_node debug_ik_node
+# --- 작은 테스트용 master 노드: /vision을 /master2mani로 릴레이하고, 뜬 지 5초 뒤
+# activate_cmd(true)를 한 번 보내서 main_node.cpp를 실제 master/task_planner 없이
+# 단독으로 테스트할 수 있게 함.
+add_executable(master_node src/master_node.cpp)
+ament_target_dependencies(master_node
+  rclcpp
+  std_msgs
+  geometry_msgs
+  irc_humanoid_interfaces
+)
+
+install(TARGETS main_node debug_node debug_ik_node master_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

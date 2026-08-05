@@ -439,7 +439,7 @@
     <child link="lense_1"/>
   </joint>
   <joint name="ee" type="fixed">
-    <origin rpy="0 0 0" xyz="0.0001 -0.0205 -0.15"/>
+    <origin rpy="0 0 0" xyz="0.0001 -0.0205 -0.13"/>
     <parent link="left_arm_1"/>
     <child link="ee_link_1"/>
   </joint>

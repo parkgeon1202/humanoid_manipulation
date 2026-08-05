@@ -5,10 +5,19 @@ manipulation_node_cpp:
     status_topic: /motor_status
 
     # 그립 모터(6번) 정지 판정: |velocity| < moving_velocity_threshold이면 정지로 봄.
-    # 정지 시 |position| <= near_zero_position_threshold면 아무것도 못 집은 것으로
-    # 판정하고 PICK_READY로 재시도.
-    grip.moving_velocity_threshold: 0.3
-    grip.near_zero_position_threshold: 0.2
+    # 정지 시 |position - gripper.closed_deg| <= near_zero_position_threshold면
+    # (완전히 닫힘 자리까지 다 갔으면) 아무것도 못 집은 것으로 판정하고 PICK_READY로
+    # 재시도. velocity가 uint8 raw 값이 아니라 부호 있는 rad/s로 바뀐 뒤(2026-08-04)
+    # 다시 튜닝한 값. near_zero_position_threshold: 완전히 닫힘(raw 1630) ~ 최대
+    # 크기 공을 잡았을 때 멈추는 자리(raw 1800) 사이가 약 0.26rad(170틱)뿐이라, 그
+    # 중 "사실상 못 집음"으로 볼 여유분을 0.1rad(약 65틱)로 좁게 잡음.
+    grip.moving_velocity_threshold: 0.35
+    grip.near_zero_position_threshold: 0.15
+
+    # velocity가 threshold 밑으로 이 tick 수만큼 연속으로 유지돼야 "진짜 멈췄다"로
+    # 확정함(1틱만 보고 확정하면 정지 마찰/토크 리플로 인한 순간적인 속도 저하를
+    # 오탐해서 훨씬 덜 오므린 채로 그립 완료 처리되는 문제가 있었음).
+    grip.stopped_streak_ticks: 10
 
     # COMPLETE_GRIP 모션(74번) 종료 후 그립이 실제로 됐는지 확인차 그립 모터를
     # 살짝 움직이는(kick) 목표각(rad).
@@ -31,7 +40,7 @@ manipulation_node_cpp:
     ik.damping_increase_factor: 2.0
 
     # 한 스텝에서 "목표에 도달했다"고 볼 위치 오차(m).
-    ik.tol: 0.01
+    ik.tol: 0.003
 
     # 매 스텝 QP로 구한 "이상적인" 보정량 중 실제로 적용할 비율(학습률).
     ik.alpha: 0.5
@@ -41,13 +50,13 @@ manipulation_node_cpp:
     ik.trust_region_acceptable_ratio: 0.1
 
     # ik_step 내부의 weighted 정규화 계수: [torso_yaw, l_shoulder_pitch,
-    # l_shoulder_roll, l_elbow_pitch]. 값이 클수록 그 관절을 더 아껴 씀. 왼팔을
-    # 10배 아껴서(torso_yaw는 1) 웬만하면 torso로 풀게 유도(joint_weight_scale과 짝).
-    ik.joint_weights: [1.0, 10.0, 10.0, 10.0]
+    # l_shoulder_roll, l_elbow_pitch]. 값이 클수록 그 관절을 더 아껴 씀(torso_yaw는
+    # 1로 웬만하면 torso로 풀게 유도, joint_weight_scale과 짝).
+    ik.joint_weights: [1.0, 5.0, 1.0, 10.0]
 
     # joint_weights 앞에 곱해지는 고정 세기. damping과 독립적으로 둠(damping에
     # 얹으면 수렴이 잘 될수록 이 항이 무의미해짐).
-    ik.joint_weight_scale: 0.005
+    ik.joint_weight_scale: 0.2
 
     # null-space 2차목표(현재는 그리퍼 방향 정렬(eeOrientationAlignmentDq) 전용 -
     # elbowTorsoAvoidanceDq 충돌회피는 당분간 안 씀) 가중치. EE 위치 오차 항(가중치
@@ -80,23 +89,30 @@ manipulation_node_cpp:
 
     # torso_yaw 킥과 함께 팔꿈치도 이 각도(rad)만큼 굽혀서 리셋함. 펴둔 채로(0.0)
     # 두면 다리/공을 치는 경우가 있어서 굽힘.
-    ik.elbow_kick_rad: 1.4
+    ik.elbow_kick_rad: 0.0
 
     # 위와 동일한 이유로 어깨 pitch도 0.0 대신 이 각도(rad)로 리셋함.
-    ik.left_shoulder_pitch_kick_rad: -2.3
+    ik.left_shoulder_pitch_kick_rad: -2.7
 
     # PICK_READY 진입 시 비전을 캡처하기 전에 먼저 돌아갈 대기 자세(rad):
     # [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch].
-    # left_shoulder_pitch는 ik.left_shoulder_pitch_kick_rad와 동일하게 -2.3으로,
-    # left_shoulder_roll은 ik.left_shoulder_roll_target_rad와 동일하게 1.0으로,
-    # left_elbow_pitch는 ik.elbow_kick_rad와 동일하게 1.4로 맞춤.
-    pick_ready_home_q: [0.0, -2.3, 1.0, 1.4]
+    # torso_yaw(첫 값)는 stepPickReady가 비전 y 부호로 매번 다시 정해서 덮어쓰므로
+    # 여기 값은 실제로 안 쓰임(아래 ik.pick_ready_torso_bias_rad 참고) - 자리만
+    # 맞추려고 0.0으로 둠. left_shoulder_pitch는 ik.left_shoulder_pitch_kick_rad와
+    # 동일하게 -2.7로, left_shoulder_roll은 ik.left_shoulder_roll_target_rad와
+    # 동일하게 0.3으로, left_elbow_pitch는 ik.elbow_kick_rad와 동일하게 0.0으로 맞춤.
+    pick_ready_home_q: [0.0, -2.7, 0.3, 0.0]
 
-    # PICK_READY: 비전을 캡처하면 torso_yaw는 더 이상 미리 고정 회전시키지 않고
-    # (예전엔 이 각도(rad)까지 회전 후 settle을 기다렸음 - 실기에서 그 ~90도 회전
-    # 자체가 불필요하다고 판단해서 뺌), 팔만 home_q_full의 ready 자세인 채로 바로
-    # 도달 가능 IK로 넘어감. left_shoulder_roll_target_rad는 정체 킥 리셋 때만 씀.
-    ik.left_shoulder_roll_target_rad: 1.0
+    # PICK_READY 진입 시 torso_yaw를 이 크기(rad)만큼 비전 y가 가리키는 쪽으로
+    # 미리 기울여둠(y가 오른쪽/음수면 -이 값, 왼쪽/양수면 +이 값) - 그 방향에서
+    # 도달 가능 IK를 시작하면 더 빨리 수렴함. left_shoulder_roll_target_rad는
+    # 정체 킥 리셋 때만 씀.
+    ik.left_shoulder_roll_target_rad: 0.3
+    ik.pick_ready_torso_bias_rad: 1.0
+
+    # 비전 y값의 실측 오프셋(m) - 비전을 캡처하는 순간(PICK_READY의 torso 편향
+    # 결정, VIRTUAL_PLACE의 IK 목표 둘 다) target_pos_.y()에서 이 값을 빼서 보정함.
+    ik.vision_y_offset: 0.016
 
     # "모터가 목표에 도달했다"는 판정 전부(위 허리+어깨 회전은 물론, COMPLETE_PLACE에서
     # 팔을 0.0으로 홈잉할 때도) 이 두 값을 공유해서 씀 - 위치/속도 둘 다 만족해야
@@ -105,7 +121,10 @@ manipulation_node_cpp:
     ik.torso_settle_velocity_threshold: 0.3
     ik.torso_settle_position_tolerance_rad: 0.3
 
-    # 그리퍼 열림/닫힘/스텝 각도(도).
-    gripper.open_deg: 30.0
-    gripper.closed_deg: 0.0
-    gripper.step_deg: 0.6
+    # 그리퍼 열림/닫힘 목표 각도(도). 한 번에 목표로 명령하고 실제 이동 속도는
+    # profile_velocity(1.0)에 맡김 - 더 이상 매 tick 조금씩 당기지 않음. closed_deg는
+    # 다이나믹셀 raw 1630틱(모터 자체 위치 단위)을 rad으로 변환한 값
+    # ((1630/4095)*2pi - pi ≈ -0.640593rad)을 다시 도(deg)로 바꾼 것 - 실제 완전히
+    # 닫히는 위치가 0도가 아니라 이 값이라 그대로 맞춤.
+    gripper.open_deg: 25.0
+    gripper.closed_deg: -36.7033
