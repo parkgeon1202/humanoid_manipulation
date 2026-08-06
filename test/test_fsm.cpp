@@ -153,20 +153,21 @@ TEST(ManipulationFsm, PickReadyBiasesTorsoTowardVisionYOnceArmSettledThenAdvance
   fsm->set_motor_position("4", 1.4);
   fsm->set_motor_velocity("4", 0.0);
 
-  // 팔 settle이 확인된 뒤에야 비전 캡처가 실제로 쓰임 - y가 양수(왼쪽)이므로
-  // torso_yaw를 +pick_ready_torso_bias_rad(기본 1.0)로 명령해야 함.
-  fsm->update_vision(0.05, 0.15, -0.15);
+  // 팔 settle이 확인된 뒤에야 비전 캡처가 실제로 쓰임 - y가 음수(오른쪽)이므로
+  // torso_yaw를 -pick_ready_torso_bias_rad(기본 1.0, 오른쪽은 그대로 -1.0)로
+  // 명령해야 함(왼쪽/양수 쪽은 지금 *0.0이라 이 분기로는 의미 있는 검증이 안 됨).
+  fsm->update_vision(0.05, -0.15, -0.15);
   const FsmAction torso_commanded = fsm->solve_tick();
   ASSERT_TRUE(torso_commanded.publish_motor_command);
   EXPECT_EQ(torso_commanded.state_string, "PICK.PICK_READY");  // 아직 PICK 아님
-  EXPECT_NEAR(torso_commanded.motor_goal_positions.at("22"), 1.0, 1e-9);
+  EXPECT_NEAR(torso_commanded.motor_goal_positions.at("22"), -1.0, 1e-9);
 
   // torso가 아직 그 값에 도달하지 않았으면 PICK_READY에 계속 머무름.
   const FsmAction torso_still_moving = fsm->solve_tick();
   EXPECT_EQ(torso_still_moving.state_string, "PICK.PICK_READY");
 
-  // torso가 실제로 편향값(1.0)에 도달했다고 피드백하면 그제서야 PICK으로 전이.
-  fsm->set_motor_position("22", 1.0);
+  // torso가 실제로 편향값(-1.0)에 도달했다고 피드백하면 그제서야 PICK으로 전이.
+  fsm->set_motor_position("22", -1.0);
   fsm->set_motor_velocity("22", 0.0);
   const FsmAction entered_pick = fsm->solve_tick();
   EXPECT_EQ(entered_pick.state_string, "PICK.PICK");

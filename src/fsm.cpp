@@ -314,7 +314,13 @@ bool ManipulationFSM::allSettled(const std::vector<std::pair<std::string, double
 // 못 집은 것으로 판단하고 PICK_READY로 되돌아가게 함. 공을 잡으면 현재 위치를 목표로 고정하고 COMPLETE_GRIP로 전이함
 bool ManipulationFSM::checkGripMotorStopped(double motor6_velocity)
 {
-  if (!(phase_ == Phase::PICK && pick_state_ == PickState::PICK)) {
+  // ik_converged_까지 확인해야 함 - PICK_READY 동안 그리퍼가 closed_rad에 그대로
+  // 있다가(stepPickReady는 그리퍼를 안 건드림) PICK 재진입 시 gripper_position_이
+  // open으로 리셋되면서 그리퍼가 다시 열리는 움직임 자체가 "그립 모터가 움직였다가
+  // 멈춤"으로 잡혀서, IK가 수렴하기도 전에(아직 실제로 닫으라고 명령도 안 냈는데)
+  // "멈춘 위치가 closed_rad 근처가 아니다" -> "뭔가 집었다"로 오판하는 버그가 있었음.
+  // IK가 수렴해서 실제로 닫으라는 명령이 나간 뒤부터만 이 판정을 시작함.
+  if (!(phase_ == Phase::PICK && pick_state_ == PickState::PICK && ik_converged_)) {
     grip_motor_was_moving_ = false;
     grip_stopped_streak_ = 0;
     return false;
@@ -595,7 +601,7 @@ void ManipulationFSM::solveTickImpl()
     stepReachableIk(/*opening_gripper=*/true);
     return;
   }
-
+  
   if (place_state_ == PlaceState::COMPLETE_PLACE) {
     stepCompletePlaceHoming(state_changed);
     return;
@@ -606,8 +612,8 @@ void ManipulationFSM::solveTickImpl()
 }
 
 // 그립 성공(COMPLETE_GRIP 진입) 직후: 모션을 바로 재생하지 않고, 먼저 왼팔을
-// home_q로 복귀시켜 전부 settle된 뒤에야 모션(74)을 재생함(집은 자세 그대로
-// 모션을 태우면 팔이 이상한 궤적을 그릴 수 있어서).
+// (집은 채로 안전하게 들고 있을) 별도 자세로 복귀시켜 전부 settle된 뒤에야
+// 모션(74)을 재생함(집은 자세 그대로 모션을 태우면 팔이 이상한 궤적을 그릴 수 있어서).
 void ManipulationFSM::stepCompleteGripHoming(bool state_changed)
 {
   if (state_changed) {
@@ -772,7 +778,7 @@ void ManipulationFSM::stepPickReady(bool state_changed)
     // 아래 2단계 settle 확인만 거쳐서 넘어감.
     if (std::fabs(target_pos_.y()) >= 0.02) {
       q_[ik::kTorsoJointIndex] = (target_pos_.y() >= 0.0)
-        ? ik_tuning_.pick_ready_torso_bias_rad
+        ? ik_tuning_.pick_ready_torso_bias_rad * 0.0
         : -ik_tuning_.pick_ready_torso_bias_rad;
       set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
     }
