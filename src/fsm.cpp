@@ -1,28 +1,13 @@
 #include "fsm.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 
 namespace
 {
-// motor_status(CurrentMotorStatus)/dynamixel_control(DynamixelControlMsgs)의
-// 배열은 이 순서(모터 id)대로 채워짐 -> 인덱스 i가 kMotorIdOrder[i]에 대응.
-// main_node.cpp/debug_node.cpp에 있던 것과 동일 - fsm.cpp가 상태별 로직을 전부
-// 흡수하면서 이 상수들도 여기로 옮김(main_node.cpp/debug_node.cpp가 각자 안
-// 들고 있게 해서 하나로 통일 - 예전엔 두 파일의 kOtherArmMotorIds 값이 서로
-// 달랐던 버그가 있었음). tilt(23번)는 이 시스템에서 아예 제어 안 하기로 해서
-// 목록에서 뺌(다른 시스템이 구동 - 우리가 값을 보내거나 읽을 이유가 없음).
-const std::vector<std::string> kMotorIdOrder = {
-  "0", "1", "2", "3", "4", "5", "6",
-  "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21",
-  "22"};
-
-// COMPLETE_PLACE 홈잉이 0.0으로 명령/정지 확인하는 모터들의 kMotorIdOrder 인덱스.
-// kMotorIdOrder[0]="0"(l_shoulder_pitch), [2]="2"(l_shoulder_roll), [4]="4"(l_elbow),
-// [19]="22"(torso_yaw) - 다리(10~21)는 포함 안 됨(그 자세 그대로 유지).
-constexpr std::array<size_t, 4> kArmMotorIndices = {0, 2, 4, 19};
-
 const std::vector<std::string> kLegMotorIds = {
   "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21"};
 
@@ -34,6 +19,25 @@ const std::string kLeftShoulderPitchMotorId = "0";
 const std::string kLeftShoulderRollMotorId = "2";
 const std::string kLeftElbowMotorId = "4";
 const std::string kGripMotorId = "6";
+
+// 비전 쪽이 탐지 실패를 알리는 통짜 센티널 값(x/y/z 셋 다 이 값) -
+// tryCapturePendingVision() 참고.
+constexpr double kVisionInvalidSentinel = -0.999;
+// kVisionInvalidSentinel과의 비교는 exact ==가 아니라 이 오차 안에서 판정함 -
+// /master2mani가 geometry_msgs::msg::Point32(필드가 float32)라 -0.999f가 double로
+// 승격되면 -0.9990000128746033... 처럼 double 리터럴 -0.999와 비트가 안 맞아서
+// exact ==가 항상 false로 새는 버그가 있었음(float32 round-trip 오차는 1e-7 수준 -
+// 이 값은 넉넉히 그보다 크고, 실측 좌표가 우연히 -0.999 근처로 올 걱정은 없는 크기).
+constexpr double kVisionSentinelEpsilon = 1e-4;
+// 공(PICK_READY) 캡처 전용 범위 제한(m) - tryCapturePendingVision() 참고.
+constexpr double kVisionMagnitudeBound = 0.33;
+
+// PICK 전용(stepReachableIk 참고): EE가 목표 근처까지 왔는데(이 거리 안) 아직
+// tol 안으로 수렴은 못 했고, 그런데도 실측 관절 속도(motor_velocity, 시뮬레이션
+// dq가 아니라 실제 피드백)가 전부 이 값 미만이면(=사실상 멈춘 상태) joint_weight_scale
+// 정규화가 남은 오차를 줄이는 걸 방해한다고 보고 0.0으로 꺼버림.
+constexpr double kPickNearTargetDistanceM = 0.02;
+constexpr double kPickStalledJointVelocityRadPerSec = 0.1;
 }  // namespace
 
 ManipulationFSM::ManipulationFSM(const std::string & urdf_path, const std::string & ee_frame)
@@ -150,6 +154,17 @@ double ManipulationFSM::motor_goal_position(const std::string & motor_id) const
   return it == motor_goal_positions_.end() ? motor_position(motor_id) : it->second;
 }
 
+void ManipulationFSM::set_tilt_position(double position)
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  tilt_position_ = position;
+}
+void ManipulationFSM::set_tilt_velocity(double velocity)
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  tilt_velocity_ = velocity;
+}
+
 
 
 
@@ -163,15 +178,63 @@ void ManipulationFSM::update_vision(double x, double y, double z)
   vision_z_ = z;
 }
 
-bool ManipulationFSM::tryCapturePendingVision(Eigen::Vector3d * out)
+bool ManipulationFSM::tryCapturePendingVision(Eigen::Vector3d * out, bool check_magnitude_bound)
 {
   std::lock_guard<std::mutex> lock(data_mutex_);
   if (!has_pending_vision_) {
     return false;
   }
-  *out = Eigen::Vector3d(vision_x_, vision_y_, vision_z_);
   has_pending_vision_ = false;
+  // 비전 쪽이 탐지 실패를 x/y/z 셋 다 0.0인 통짜 센티널로 보내는 경우 - 평균에 안
+  // 섞이게 이 샘플은 버림(has_pending_vision_은 이미 위에서 소비했으므로 다음
+  // 메시지가 와야 재시도됨, count/sum은 안 건드림).
+  const bool is_all_zero = vision_x_ == 0.0 && vision_y_ == 0.0 && vision_z_ == 0.0;
+  // -0.999(kVisionInvalidSentinel)는 x/y/z가 항상 셋 다 같이 오는 게 아니라 축별로
+  // 따로 실패할 수 있음(예: z만 깊이 계산 실패로 -0.999, x/y는 정상)이라 하나라도
+  // 센티널이면 샘플 전체를 버림. 비교는 exact ==가 아니라 kVisionSentinelEpsilon
+  // 오차 안에서 판정(위 주석 참고 - float32->double 승격 오차로 exact ==는 항상
+  // false로 새서 셋 다 -0.999인 표본조차 안 걸러지던 버그가 실측에서 확인됨).
+  const bool has_invalid_sentinel =
+    std::fabs(vision_x_ - kVisionInvalidSentinel) < kVisionSentinelEpsilon ||
+    std::fabs(vision_y_ - kVisionInvalidSentinel) < kVisionSentinelEpsilon ||
+    std::fabs(vision_z_ - kVisionInvalidSentinel) < kVisionSentinelEpsilon;
+  // 공(PICK_READY) 캡처 전용: x/y/z 셋 다 절댓값이 kVisionMagnitudeBound(0.33)를
+  // 넘는 표본도 버림(골대/VIRTUAL_PLACE 캡처는 check_magnitude_bound=false로
+  // 호출해서 이 범위 제한을 안 걺).
+  const bool is_all_out_of_bound = check_magnitude_bound &&
+    std::fabs(vision_x_) > kVisionMagnitudeBound &&
+    std::fabs(vision_y_) > kVisionMagnitudeBound &&
+    std::fabs(vision_z_) > kVisionMagnitudeBound;
+  if (is_all_zero || has_invalid_sentinel || is_all_out_of_bound) {
+    return false;
+  }
+  const Eigen::Vector3d sample(vision_x_, vision_y_, vision_z_);
+  vision_sample_sum_ += sample;
+  vision_samples_.push_back(sample);
+  ++vision_sample_count_;
+  if (vision_sample_count_ < kVisionSampleTarget) {
+    // 아직 kVisionSampleTarget개를 다 못 모음 - 호출부는 다음 tick에 새 pending
+    // 값이 들어오면 다시 시도함(기존 재시도 패턴 그대로, 여기서 블로킹 안 함).
+    return false;
+  }
+  *out = vision_sample_sum_ / static_cast<double>(kVisionSampleTarget);
+  for (int i = 0; i < static_cast<int>(vision_samples_.size()); ++i) {
+    std::printf(
+      "[vision_sample_debug] sample[%d]=(%.4f, %.4f, %.4f)\n",
+      i, vision_samples_[i].x(), vision_samples_[i].y(), vision_samples_[i].z());
+  }
+  vision_sample_count_ = 0;
+  vision_sample_sum_.setZero();
+  vision_samples_.clear();
   return true;
+}
+
+void ManipulationFSM::resetVisionSampleAccumulator()
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  vision_sample_count_ = 0;
+  vision_sample_sum_.setZero();
+  vision_samples_.clear();
 }
 
 void ManipulationFSM::discardPendingVision()
@@ -205,6 +268,9 @@ std::optional<int32_t> ManipulationFSM::entry_motion_number() const
   }
   if (phase_ == Phase::PICK && pick_state_ == PickState::DONE) {
     return 75;
+  }
+  if (phase_ == Phase::PLACE && place_state_ == PlaceState::COMPLETE_PLACE) {
+    return 76;
   }
   return std::nullopt;
 }
@@ -254,6 +320,7 @@ FsmAction & ManipulationFSM::makeActionSnapshot(bool publish_motor_command, doub
   action_.profile_velocity = profile_velocity;
   action_.play_motion_number = play_motion_number;
   action_.deactivate_and_notify = deactivate_and_notify;
+  action_.reset_pan_tilt_level = false;  // onMotionEndImpl의 DONE 분기에서만 별도로 true로 덮어씀
   action_.phase = phase_;
   action_.pick_state = pick_state_;
   action_.place_state = place_state_;
@@ -307,6 +374,20 @@ bool ManipulationFSM::allSettled(const std::vector<std::pair<std::string, double
     }
   }
   return true;
+}
+
+// isSettled()와 동일한 속도/위치 임계값 판정을 tilt 전용으로 - 목표는 레벨(0.0) 고정.
+bool ManipulationFSM::isTiltSettled() const
+{
+  double position = 0.0;
+  double velocity = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    position = tilt_position_;
+    velocity = tilt_velocity_;
+  }
+  return std::fabs(velocity) < ik_tuning_.settle_velocity_threshold &&
+         std::fabs(position) < ik_tuning_.settle_position_tolerance_rad;
 }
 
 // 그리퍼 역할의 모터가 움직이는 명령어를 주면 움직인다는 것을 이 함수가 판단하고 공을 집었을 때 정지하며 완전히 닫힘(gripper_closed_rad, 아무것도 못 집었을 때
@@ -473,6 +554,8 @@ void ManipulationFSM::onMotionEndImpl(bool ended)
   }
 
   if (phase_ == Phase::PICK && pick_state_ == PickState::DONE) {
+    // 모션 75(DONE 재활성화 진입 모션)가 끝나는 순간 - advance()가 상태를 바꾸기
+    // 전에 여기서 판정. 카메라를 레벨(tilt=0)로 되돌리라고 main_node.cpp에 알림.
     if (advance()) {  // DONE -> PLACE.VIRTUAL_PLACE
       for (const auto & id : kLegMotorIds) {
         set_motor_goal_position(id, motor_position(id));
@@ -482,10 +565,12 @@ void ManipulationFSM::onMotionEndImpl(bool ended)
       }
       makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
                           /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+      action_.reset_pan_tilt_level = true;
       return;
     }
     makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    action_.reset_pan_tilt_level = true;
     return;
   }
 
@@ -502,6 +587,14 @@ void ManipulationFSM::onMotionEndImpl(bool ended)
     }
     makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
+  }
+
+  if (phase_ == Phase::PLACE && place_state_ == PlaceState::COMPLETE_PLACE) {
+    // stepCompletePlaceHoming이 역재생 IK 수렴 + settle 확인 후 재생한 모션(76)이
+    // 끝난 시점 - 시퀀스 전체의 마지막이라 여기서 바로 deactivate.
+    makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/true);
     return;
   }
   makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
@@ -530,9 +623,22 @@ void ManipulationFSM::solveTickImpl()
         kick_settling_ = false;
         ik_converged_ = false;
         gripper_position_ = ik_tuning_.gripper_open_rad;
+        active_joint_weights_ = ik_tuning_.joint_weights;
+        active_joint_weight_scale_ = ik_tuning_.joint_weight_scale;
 
         // q_/target_pos_는 유지 - PICK_READY에서 회전시켜둔 자세 + 캡처해둔
         // 목표를 그대로 IK 시작점/목표로 씀(이번 마일스톤의 핵심 요구사항).
+      }
+      // pick_approach_trajectory_는 stepPickReady가 PICK 전이 직전 이미 만들어둠 -
+      // 여기선 매 틱 result(pick_approach_traj_time_)로 target_pos_만 갱신. 궤적이
+      // 아직 안 끝났으면(VIRTUAL_PLACE와 동일 이유) ik_converged_를 계속 false로
+      // 눌러서, 목표가 계속 움직이는 동안 중간에 스치듯 수렴해도 안 굳게 함.
+      const bool approach_in_progress =
+        pick_approach_traj_time_ < ik_tuning_.pick_approach_duration_sec;
+      target_pos_ = pick_approach_trajectory_.result(pick_approach_traj_time_);
+      pick_approach_traj_time_ += ik_tuning_.place_traj_dt_sec;
+      if (approach_in_progress) {
+        ik_converged_ = false;
       }
       stepReachableIk(/*opening_gripper=*/false);
       return;
@@ -558,6 +664,13 @@ void ManipulationFSM::solveTickImpl()
       kick_settling_ = false;
       ik_converged_ = false;
       has_captured_target_ = false;
+      resetVisionSampleAccumulator();
+      tilt_settle_vision_discarded_ = false;
+      // stepPickReady처럼 여기서 바로 discardPendingVision()을 부르진 않음 - 아직
+      // tilt가 settle되기 전이라 discard해봤자 그 사이 계속 들어오는 값으로 다시
+      // 채워짐. 대신 isTiltSettled()가 처음 true가 되는 tick에 한 번만 버림(아래).
+      active_joint_weights_ = ik_tuning_.place_joint_weights;
+      active_joint_weight_scale_ = ik_tuning_.joint_weight_scale;
       place_trajectory_.clear();
       place_traj_time_ = 0.0;
       // gripper_closed_rad(yaml 설정값)이 아니라 실제로 물건을 집은 위치
@@ -568,13 +681,23 @@ void ManipulationFSM::solveTickImpl()
       // 없이 비전을 캡처하는 즉시 도달 가능 IK로 들어감("공 놓으면 끝" 요구사항).
     }
     if (!has_captured_target_) {
-      if (!tryCapturePendingVision(&target_pos_)) {
+      // 모션 75 종료 시 카메라를 레벨로 되돌리라고 명령했지만(onMotionEndImpl의
+      // reset_pan_tilt_level -> main_node.cpp가 /master/pan_tilt에 place용 tilt
+      // 모드=5(0°)를 publish), 실제로 그 각도까지 돌아오는 데는 시간이 걸림 - 아직 안
+      // 돌아온 채로 찍은 좌표는 못 믿으므로 settle될 때까지 캡처 시도 자체를 미룸.
+      if (!isTiltSettled()) {
+        makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                            /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+        return;
+      }
+      // 골대(place 목표) 캡처 - 공(PICK_READY)과 달리 magnitude bound는 안 걺.
+      if (!tryCapturePendingVision(&target_pos_, /*check_magnitude_bound=*/false)) {
         makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
                             /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
         return;
       }
       // 비전 y의 실측 오프셋을 캡처 시점에 바로 보정(stepPickReady와 동일).
-      target_pos_.y() -= ik_tuning_.vision_y_offset;
+      //target_pos_.y() -= ik_tuning_.vision_y_offset;
       has_captured_target_ = true;
 
       // 시작점(현재 EE, q_로 FK) -> 정점(장애물 회피, 고정 x/y 튜닝값) -> 목표(비전
@@ -582,22 +705,57 @@ void ManipulationFSM::solveTickImpl()
       // 직선이 되게 함(경계조건이 일치하면 quintic이 정확히 직선으로 퇴화함).
       const Eigen::Vector3d start_pos = ik::eePosition(robot_model_, q_);
       const double duration = ik_tuning_.place_traj_duration_sec;
-      const double apex_time = duration / 3.0;  // 시작->정점: duration/3, 정점->목표: 나머지
+   
       const double vz = (target_pos_.z() - start_pos.z()) / duration;
 
       place_trajectory_.put_point(
         0.0, start_pos.x(), start_pos.y(), start_pos.z(),
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
       place_trajectory_.put_point(
-        apex_time, ik_tuning_.place_apex_x, ik_tuning_.place_apex_y,
-        start_pos.z() + vz * apex_time,
+        duration * 0.1, target_pos_.x()*0.1, target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration * 0.1,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
       place_trajectory_.put_point(
-        duration, target_pos_.x(), target_pos_.y(), target_pos_.z(),
+        duration * 0.2, target_pos_.x()*0.5, target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration * 0.2,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+      place_trajectory_.put_point(
+        duration * 0.3, target_pos_.x()*0.8, target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration * 0.3,
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+      place_trajectory_.put_point(
+        duration * 0.5, target_pos_.x()*0.99, target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration * 0.8,
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+      place_trajectory_.put_point(
+        duration * 0.7, target_pos_.x(), target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration * 1.0,
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
+      place_trajectory_.put_point(
+        duration * 0.8, target_pos_.x(), target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration +  0.1,
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
+      place_trajectory_.put_point(
+        duration * 0.9, target_pos_.x(), target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration + 0.1,
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
+
+      place_trajectory_.put_point(
+        duration, target_pos_.x(), target_pos_.y(), start_pos.z() + vz * duration + 0.1,
+        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
     }
+    // 궤적이 아직 끝나지 않았으면(목표 지점 도달 전) target_pos_가 매 tick 계속
+    // 움직이므로, 이전 tick에 ik_converged_가 true가 됐어도 다시 풀게 리셋함 -
+    // 안 그러면 궤적 시작점(=캡처 직전의 현재 EE 위치라 오차가 거의 0)에서 바로
+    // "도달함"으로 굳어버려서, 그 뒤로 목표가 정점/최종 목표로 계속 움직여도
+    // stepReachableIk의 if(!ik_converged_) 가드에 막혀 다시는 IK를 안 풀게 됨
+    // (그리퍼가 시작 위치에서 바로 열려버리는 버그).
+    const bool trajectory_in_progress = place_traj_time_ < ik_tuning_.place_traj_duration_sec;
     target_pos_ = place_trajectory_.result(place_traj_time_);
     place_traj_time_ += ik_tuning_.place_traj_dt_sec;
+    if (trajectory_in_progress) {
+      ik_converged_ = false;
+    }
     stepReachableIk(/*opening_gripper=*/true);
     return;
   }
@@ -691,26 +849,74 @@ void ManipulationFSM::stepDoneHoming(bool state_changed)
 
 void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
 {
-  // motor_goal_positions_는 멤버(계속 유지되는 맵)라서 한 번만 0.0으로 세팅해두면
-  // 그 뒤 tick들은 다시 set할 필요 없음 - finalize()가 매번 그 값을 그대로
-  // 스냅샷해서 실어줌(매 tick 다시 루프 돌면서 set하던 걸 없앰).
   if (state_changed) {
-    for (size_t idx : kArmMotorIndices) {
-      if (idx < kMotorIdOrder.size()) {
-        set_motor_goal_position(kMotorIdOrder[idx], 0.0);
-      }
-    }
+    // VIRTUAL_PLACE는 그리퍼가 열릴 때까지 기다리는 동안에도 place_traj_time_을
+    // duration 너머로 계속 흘려보내므로(그 tick들도 매번 += dt_sec), 역재생
+    // 시작점을 duration으로 다시 고정하고 IK를 강제로 다시 풀게 함 - place_trajectory_
+    // 자체는 아직 clear() 안 됐으므로(다음 VIRTUAL_PLACE 진입 때만 지워짐) 그대로 재사용.
+    place_traj_time_ = ik_tuning_.place_traj_duration_sec;
+    ik_converged_ = false;
+    damping_ = ik_tuning_.default_damping;
+    stuck_streak_ = 0;
+    kick_settling_ = false;
+    // 그냥 놓았던 자리로 되짚어 돌아가는 구간이라 조인트 사용량을 아낄 이유가
+    // 없음 - joint_weight_scale 정규화를 꺼서(0.0) IK가 더 자유롭게/빠르게 풀게 함.
+    active_joint_weight_scale_ = 0.0;
   }
 
-  std::vector<std::pair<std::string, double>> targets;
-  for (size_t idx : kArmMotorIndices) {
-    if (idx < kMotorIdOrder.size()) {
-      targets.emplace_back(kMotorIdOrder[idx], 0.0);
-    }
+  // 모션(76)이 재생 중이면 SIT/DONE/COMPLETE_GRIP 진입 모션과 동일하게 완전히
+  // 조용해짐(stepCompleteGripHoming과 동일 이유 - 외부 모션 재생기가 다리/반대팔을
+  // 포함한 전신을 직접 구동하는 동안 우리가 q_ 유지 명령을 계속 보내면 충돌함).
+  if (motion_in_flight_) {
+    makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    return;
   }
-  makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
-                      /*play_motion_number=*/std::nullopt,
-                      /*deactivate_and_notify=*/allSettled(targets));
+
+  // place_traj_time_이 아직 0 위(reverse_in_progress)거나, 0에 도달했어도 마지막
+  // 목표(start_pos)로 IK가 아직 실제로 수렴 안 했으면(!ik_converged_) 계속 추적.
+  // 게이트를 ik_converged_ 하나로만 걸면(예전 버전의 버그) reverse_in_progress인
+  // 도중 중간 경유점에 스치듯 수렴해 ik_converged_가 잠깐 true가 되는 순간 다음
+  // tick부터 이 블록에 아예 안 들어오게 돼서, 남은 아크(정점 등)를 못 따라가고
+  // 궤적 극초반에서 바로 복귀 단계로 새버림 - place_traj_time_ > 0.0도 같이 걸어서
+  // 시간이 안 끝났으면 ik_converged_ 값과 무관하게 계속 이 블록에 들어오게 함.
+  if (place_traj_time_ > 0.0 || !ik_converged_) {
+    // place_trajectory_를 duration -> 0으로 거꾸로 재생 - 놓으러 갈 때 돌던 장애물
+    // 회피 아크를 그대로 되짚어감. VIRTUAL_PLACE의 순방향 루프와 동일한 이유로,
+    // 아직 시작점(t=0)에 안 왔으면 매 tick 다시 풀게 ik_converged_를 계속 false로
+    // 눌러둠(안 그러면 지난 tick에 우연히 tol 안으로 들어온 즉시 굳어버림).
+    const bool reverse_in_progress = place_traj_time_ > 0.0;
+    target_pos_ = place_trajectory_.result(place_traj_time_);
+    place_traj_time_ -= ik_tuning_.place_traj_dt_sec;
+    if (reverse_in_progress) {
+      ik_converged_ = false;
+    }
+    // opening_gripper는 ik_converged_가 false인 동안 stepReachableIk 안에서 안 쓰임
+    // (그 값을 읽는 분기는 전부 else if(ik_converged_) 쪽) - 그리퍼는 여기서 그대로
+    // 안 건드림.
+    stepReachableIk(/*opening_gripper=*/false);
+    return;
+  }
+
+  // 역재생 IK가 시작점(= PICK.DONE 재활성화 시점의 EE 위치)까지 다시 수렴함 - 그
+  // 지점(torso+왼팔)에 실제로 settle된 뒤에야(stepCompleteGripHoming과 동일한
+  // command-once + settle-poll 패턴 - q_는 추적 단계에서 이미 매 tick
+  // set_motor_goal_position으로 계속 명령해뒀으므로 여기서 다시 세팅할 필요 없음)
+  // 모션(76)을 재생해서 전신(다리+반대팔 포함)을 최종 자세로 되돌림 - 모션이
+  // 끝나면 onMotionEndImpl이 deactivate함.
+  const bool settled = allSettled({
+      {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
+      {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
+      {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
+      {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
+    });
+
+  std::optional<int32_t> motion;
+  if (settled) {
+    motion = entry_motion_number();
+  }
+  makeActionSnapshot(/*publish_motor_command=*/!settled, /*profile_velocity=*/settled ? 0.0 : 1.0,
+                      /*play_motion_number=*/motion, /*deactivate_and_notify=*/false);
 }
 
 void ManipulationFSM::stepPickReady(bool state_changed)
@@ -721,6 +927,7 @@ void ManipulationFSM::stepPickReady(bool state_changed)
     stuck_streak_ = 0;
     kick_settling_ = false;
     has_captured_target_ = false;
+    resetVisionSampleAccumulator();
     torso_bias_commanded_ = false;
     // 이전 시도(예: 그립 실패 재시도) 중에 들어와 아직 안 쓰인 낡은 비전 값이
     // 남아있을 수 있어서, 이번 시도는 항상 새 값으로만 캡처하게 미리 버림.
@@ -755,7 +962,8 @@ void ManipulationFSM::stepPickReady(bool state_changed)
     // 비전 캡처는 항상 팔 settle이 확인된 뒤에만 시도함(state_changed 직후 즉시
     // 시도하지 않음) - 아직 못 받았으면 조용히 대기.
     if (!has_captured_target_) {
-      has_captured_target_ = tryCapturePendingVision(&target_pos_);
+      // 공(PICK 목표) 캡처 - magnitude bound(0.33)까지 적용.
+      has_captured_target_ = tryCapturePendingVision(&target_pos_, /*check_magnitude_bound=*/true);
       if (has_captured_target_) {
         // 비전 y의 실측 오프셋을 캡처 시점에 바로 보정해둠 - 이후 torso 편향
         // 방향 결정은 물론, stepReachableIk의 실제 IK 목표(target_pos_)에도
@@ -796,6 +1004,19 @@ void ManipulationFSM::stepPickReady(bool state_changed)
     return;
   }
 
+  // 이 시점엔 q_(torso + 왼팔 3개)가 다 확정됨 - 이 EE 위치 -> target_pos_(비전
+  // 캡처값)를 곧장 damped-IK로 스텝하는 대신, 5차(quintic) 2점 경로로 미리 이어둠
+  // (place_trajectory_와 동일 패턴, 정점 없이 시작->목표 직행 - 장애물 회피가
+  // 필요 없어서). vel/az 등은 TrajectoryGenerator::put_point 기본값(0.0) 그대로 둬서
+  // 양 끝 vel=acc=0인 minimum-jerk 프로파일이 되게 함.
+  const Eigen::Vector3d approach_start_pos = ik::eePosition(robot_model_, q_);
+  pick_approach_trajectory_.clear();
+  pick_approach_trajectory_.put_point(
+    0.0, approach_start_pos.x(), approach_start_pos.y(), approach_start_pos.z());
+  pick_approach_trajectory_.put_point(
+    ik_tuning_.pick_approach_duration_sec, target_pos_.x(), target_pos_.y(), target_pos_.z());
+  pick_approach_traj_time_ = 0.0;
+
   advance();  // PICK_READY -> PICK
   makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
                       /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
@@ -831,8 +1052,8 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
       params.max_damping = ik_tuning_.max_damping;
       params.damping_decrease_factor = ik_tuning_.damping_decrease_factor;
       params.damping_increase_factor = ik_tuning_.damping_increase_factor;
-      params.joint_weights = ik_tuning_.joint_weights;
-      params.joint_weight_scale = ik_tuning_.joint_weight_scale;
+      params.joint_weights = active_joint_weights_;
+      params.joint_weight_scale = active_joint_weight_scale_;
       params.secondary_dq = secondary_dq;
       params.secondary_gain = ik_tuning_.secondary_gain;
       params.trust_region_good_ratio = ik_tuning_.trust_region_good_ratio;
@@ -860,11 +1081,11 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
         const double error_y = target_pos_.y() - current_ee_pos.y();
         const double kick = q_[ik::kTorsoJointIndex] +
           (error_y < 0.0 ? -ik_tuning_.torso_kick_step_rad : ik_tuning_.torso_kick_step_rad);
-        q_ = Eigen::VectorXd::Zero(robot_model_.model().nq);
+        // 팔도 (막혀서 이상하게 꼬여있을 수 있는) 현재 자세 대신 home_q_full로 되돌려서
+        // 킥 후 재수렴이 알려진 좋은 자세에서 다시 시작하게 함 - torso_yaw만 kick 값으로
+        // 덮어씀.
+        q_ = ik_tuning_.home_q_full;
         q_[ik::kTorsoJointIndex] = kick;
-        q_[ik::kLeftArmIndices[0]] = ik_tuning_.left_shoulder_pitch_kick_rad;
-        q_[ik::kLeftArmIndices[1]] = ik_tuning_.left_shoulder_roll_target_rad;
-        q_[ik::kLeftArmIndices[2]] = ik_tuning_.elbow_kick_rad;
         damping_ = ik_tuning_.default_damping;
         stuck_streak_ = 0;
         kick_settling_ = true;
@@ -880,6 +1101,29 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
           converged_ee.x(), converged_ee.y(), converged_ee.z(),
           converged_ee.x() - target_pos_.x(), converged_ee.y() - target_pos_.y(),
           converged_ee.z() - target_pos_.z(), q_[ik::kTorsoJointIndex]);
+      } else if (!opening_gripper && active_joint_weight_scale_ > 0.0) {
+        // PICK 전용(공을 집을 때) - 아직 tol 안으로는 안 왔지만 근처(kPickNearTargetDistanceM)까지
+        // 왔는데 실측 관절 속도가 전부 정지 수준(kPickStalledJointVelocityRadPerSec 미만)이면,
+        // joint_weight_scale 정규화가 남은 오차를 줄이는 걸 막고 있다고 보고 꺼버림. 거리도
+        // IK 내부 시뮬레이션 상태인 q_가 아니라 실측 motor_position()으로 FK를 다시 잡아서
+        // 계산함 - q_는 아직 실제 모터가 못 따라간 명령값일 수 있어서(motion_in_flight_ 등),
+        // "진짜 지금 EE가 목표에 얼마나 가까운지"는 실측 관절값 기준이어야 정확함.
+        Eigen::VectorXd q_real = q_;
+        q_real[ik::kTorsoJointIndex] = motor_position(kTorsoMotorId);
+        q_real[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId);
+        q_real[ik::kLeftArmIndices[1]] = motor_position(kLeftShoulderRollMotorId);
+        q_real[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId);
+        const double distance_to_target =
+          (target_pos_ - ik::eePosition(robot_model_, q_real)).norm();
+        const bool near_target = distance_to_target < kPickNearTargetDistanceM;
+        const bool joints_barely_moving =
+          std::fabs(motor_velocity(kTorsoMotorId)) < kPickStalledJointVelocityRadPerSec &&
+          std::fabs(motor_velocity(kLeftShoulderPitchMotorId)) < kPickStalledJointVelocityRadPerSec &&
+          std::fabs(motor_velocity(kLeftShoulderRollMotorId)) < kPickStalledJointVelocityRadPerSec &&
+          std::fabs(motor_velocity(kLeftElbowMotorId)) < kPickStalledJointVelocityRadPerSec;
+        if (near_target && joints_barely_moving) {
+          active_joint_weight_scale_ = 0.0;
+        }
       }
     }
   } else if (opening_gripper) {

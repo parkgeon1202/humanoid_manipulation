@@ -3,7 +3,7 @@
 <package format="3">
   <name>humanoid_manipulation</name>
   <version>0.0.0</version>
-  <description>공 집기/슛 매니퓰레이션: FSM/IK/모터 명령 루프를 전부 C++ 노드(main_node/debug_node)가 담당</description>
+  <description>공 집기/슛 매니퓰레이션: FSM/IK/모터 명령 루프를 전부 C++ 노드(main_node)가 담당</description>
   <maintainer email="geonhu@todo.todo">geonhu</maintainer>
   <license>Apache-2.0</license>
 

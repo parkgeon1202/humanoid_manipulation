@@ -54,6 +54,22 @@ manipulation_node_cpp:
     # 1로 웬만하면 torso로 풀게 유도, joint_weight_scale과 짝).
     ik.joint_weights: [1.0, 5.0, 1.0, 10.0]
 
+    # PLACE(VIRTUAL_PLACE) 전용 joint_weights - PICK과 반대로 torso_yaw를 더
+    # 아끼고(허리를 덜 쓰고) 팔 위주로 풀게 함. state_changed 시점에
+    # active_joint_weights_로 스냅샷돼서 stepReachableIk가 씀(solveTickImpl 참고).
+    ik.place_joint_weights: [100.0, 1.0, 1.0, 1.0]
+
+    # VIRTUAL_PLACE 팔 궤적의 정점(장애물 회피용 경유점, base_link 기준 x/y, m) -
+    # 시작(현재 EE)과 최종 목표(비전 캡처값) 사이에 이 지점을 거쳐가게 함.
+    place.apex_x: 0.1
+    place.apex_y: 0.3
+    # 시작->정점->목표 전체 궤적 재생 시간(초).
+    place.traj_duration_sec: 10.0
+
+    # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
+    # 소요 시간(초) - place와 달리 정점 없이 직행.
+    pick.approach_duration_sec: 1.0
+
     # joint_weights 앞에 곱해지는 고정 세기. damping과 독립적으로 둠(damping에
     # 얹으면 수렴이 잘 될수록 이 항이 무의미해짐).
     ik.joint_weight_scale: 0.2

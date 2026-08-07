@@ -27,6 +27,7 @@
 #include "dynamixel_hardware_msgs/msg/dynamixel_msgs.hpp"
 #include "fsm.hpp"
 #include "geometry_msgs/msg/point32.hpp"
+#include "irc_humanoid_interfaces/msg/master2_vision_msg.hpp"
 #include "irc_humanoid_interfaces/msg/motion_operator.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
@@ -38,6 +39,7 @@ using dynamixel_hardware_msgs::msg::CurrentMotorStatus;
 using dynamixel_hardware_msgs::msg::DynamixelControlMsgs;
 using dynamixel_hardware_msgs::msg::DynamixelMsgs;
 using geometry_msgs::msg::Point32;
+using irc_humanoid_interfaces::msg::Master2VisionMsg;
 using irc_humanoid_interfaces::msg::MotionOperator;
 using rclcpp_lifecycle::State;
 using std_msgs::msg::Bool;
@@ -55,6 +57,9 @@ const std::vector<std::string> kMotorIdOrder = {
 // 그립 모터(6번)는 이제 combined /dynamixel_control이 아니라 gripper_topic_로 단독
 // 전송함(kMotorIdOrder에서 위치 파악용으로는 여전히 필요해서 목록 자체는 유지).
 const std::string kGripMotorId = "6";
+
+// /master/pan_tilt(Master2VisionMsg)에 보내는 place용 tilt 모드 번호.
+constexpr int32_t kPlaceTiltMode = 5;
 
 std::string resolveUrdfPath()
 {
@@ -85,6 +90,13 @@ public:
     auto motor_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
     control_pub_ = create_publisher<DynamixelControlMsgs>(control_topic_, motor_qos);
     gripper_pub_ = create_publisher<DynamixelMsgs>(gripper_topic_, motor_qos);
+    // dynamixel_hardware_interface의 /RealsensePanTilt를 직접 건드리지 않고,
+    // realsense_pan_tilt_node가 구독하는 /master/pan_tilt(Master2VisionMsg)로 모드
+    // 번호를 보냄 - 그 노드가 모드->실제 각도 변환 + /RealsensePanTilt publish까지
+    // 대신함. 구독 쪽이 rclcpp::QoS(10)(기본 RELIABLE)라 여기도 맞춰줌(motor_qos는
+    // BEST_EFFORT라 그대로 쓰면 reliability가 안 맞아 디스커버리부터 연결이 안 됨).
+    pan_tilt_pub_ = create_publisher<Master2VisionMsg>(
+      pan_tilt_topic_, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
     status_sub_ = create_subscription<CurrentMotorStatus>(
       status_topic_, motor_qos,
       [this](const CurrentMotorStatus::SharedPtr msg) {on_motor_status(msg);});
@@ -126,6 +138,7 @@ public:
     solve_timer_.reset();
     control_pub_.reset();
     gripper_pub_.reset();
+    pan_tilt_pub_.reset();
     status_sub_.reset();
     mani_sub_.reset();
     motion_operator_pub_.reset();
@@ -155,6 +168,7 @@ private:
     control_topic_ = declare_parameter<std::string>("control_topic", "/dynamixel_control");
     gripper_topic_ = declare_parameter<std::string>("gripper_topic", "/gripper_control");
     status_topic_ = declare_parameter<std::string>("status_topic", "/motor_status");
+    pan_tilt_topic_ = declare_parameter<std::string>("pan_tilt_topic", "/master/pan_tilt");
     step_period_sec_ = declare_parameter<double>("ik.step_period_sec", 0.02);
 
     IkTuning tuning;
@@ -162,6 +176,8 @@ private:
     tuning.place_apex_x = declare_parameter<double>("place.apex_x", 0.1);
     tuning.place_apex_y = declare_parameter<double>("place.apex_y", 0.3);
     tuning.place_traj_duration_sec = declare_parameter<double>("place.traj_duration_sec", 3.0);
+    tuning.pick_approach_duration_sec =
+      declare_parameter<double>("pick.approach_duration_sec", 1.0);
     tuning.default_damping = declare_parameter<double>("ik.default_damping", ik::kDefaultDamping);
     tuning.min_damping = declare_parameter<double>("ik.min_damping", ik::kMinDamping);
     tuning.max_damping = declare_parameter<double>("ik.max_damping", ik::kMaxDamping);
@@ -187,6 +203,8 @@ private:
       "pick_ready_home_q", std::vector<double>{0.0, -2.7, 0.3, 0.0});
     const std::vector<double> joint_weights_4 = declare_parameter<std::vector<double>>(
       "ik.joint_weights", std::vector<double>{1.0, 1.0, 1.0, 1.0});
+    const std::vector<double> place_joint_weights_4 = declare_parameter<std::vector<double>>(
+      "ik.place_joint_weights", std::vector<double>{10.0, 1.0, 1.0, 1.0});
     tuning.joint_weight_scale = declare_parameter<double>("ik.joint_weight_scale", 0.0);
     tuning.secondary_gain = declare_parameter<double>("ik.secondary_gain", 1.0);
     tuning.orientation_align_k_pull =
@@ -225,6 +243,7 @@ private:
     const int nq = 8;
     tuning.home_q_full = Eigen::VectorXd::Zero(nq);
     tuning.joint_weights = Eigen::VectorXd::Ones(nq);
+    tuning.place_joint_weights = Eigen::VectorXd::Ones(nq);
     if (home_q.size() >= 4) {
       tuning.home_q_full[ik::kTorsoJointIndex] = home_q[0];
       for (int i = 0; i < 3; ++i) tuning.home_q_full[ik::kLeftArmIndices[i]] = home_q[i + 1];
@@ -232,6 +251,12 @@ private:
     if (joint_weights_4.size() >= 4) {
       tuning.joint_weights[ik::kTorsoJointIndex] = joint_weights_4[0];
       for (int i = 0; i < 3; ++i) tuning.joint_weights[ik::kLeftArmIndices[i]] = joint_weights_4[i + 1];
+    }
+    if (place_joint_weights_4.size() >= 4) {
+      tuning.place_joint_weights[ik::kTorsoJointIndex] = place_joint_weights_4[0];
+      for (int i = 0; i < 3; ++i) {
+        tuning.place_joint_weights[ik::kLeftArmIndices[i]] = place_joint_weights_4[i + 1];
+      }
     }
 
     fsm_->configure_ik(tuning);
@@ -274,6 +299,16 @@ private:
     const size_t nv = std::min(kMotorIdOrder.size(), msg->velocity.size());
     for (size_t i = 0; i < nv; ++i) {
       fsm_->set_motor_velocity(kMotorIdOrder[i], msg->velocity[i]);
+    }
+
+    // tilt(23번)는 kMotorIdOrder에 없어서(제어 안 함) 위 루프에서 안 채워짐 - 배열
+    // 맨 끝이 tilt 실측값이라 따로 빼서 fsm_에 넣어줌(VIRTUAL_PLACE 비전 캡처가
+    // isTiltSettled()로 카메라가 레벨까지 실제로 돌아왔는지 확인하는 용도).
+    if (!msg->position.empty()) {
+      fsm_->set_tilt_position(msg->position.back());
+    }
+    if (!msg->velocity.empty()) {
+      fsm_->set_tilt_velocity(msg->velocity.back());
     }
   }
 
@@ -357,12 +392,21 @@ private:
       activate_cmd_pub_->publish(activate_ack);
       this->deactivate();
     }
+
+    if (action.reset_pan_tilt_level) {
+      // realsense_pan_tilt_node에게 place용 tilt 모드(5)를 요청 - 그 노드가 모드를
+      // 실제 각도로 변환해서 /RealsensePanTilt에 다시 publish함.
+      Master2VisionMsg pan_tilt_msg;
+      pan_tilt_msg.tilt = kPlaceTiltMode;
+      pan_tilt_pub_->publish(pan_tilt_msg);
+    }
   }
 
   rclcpp::Subscription<Bool>::SharedPtr activate_cmd_sub_;
   rclcpp::Publisher<Bool>::SharedPtr activate_cmd_pub_;
   rclcpp::Publisher<DynamixelControlMsgs>::SharedPtr control_pub_;
   rclcpp::Publisher<DynamixelMsgs>::SharedPtr gripper_pub_;
+  rclcpp::Publisher<Master2VisionMsg>::SharedPtr pan_tilt_pub_;
   rclcpp::Subscription<CurrentMotorStatus>::SharedPtr status_sub_;
   rclcpp::Subscription<Point32>::SharedPtr mani_sub_;
   rclcpp::Publisher<MotionOperator>::SharedPtr motion_operator_pub_;
@@ -375,6 +419,7 @@ private:
   std::string control_topic_;
   std::string gripper_topic_;
   std::string status_topic_;
+  std::string pan_tilt_topic_;
   double step_period_sec_ = 0.02;
 };
 

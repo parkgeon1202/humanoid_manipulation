@@ -29,7 +29,7 @@ find_package(urdf REQUIRED)
 add_library(ik_lib
   src/ik/ik_solver.cpp
   src/ik/collision_model.cpp
-  src/ik/place_trajectory.cpp
+  src/ik/trajectory_generator.cpp
 )
 target_include_directories(ik_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -55,22 +55,8 @@ ament_target_dependencies(main_node
   irc_humanoid_interfaces
 )
 
-# --- C++ 디버그 노드: main_node.cpp와 동일한 로직, activate_cmd 없이 바로 activate
-# 하고 비전을 /vision(Vision2MasterMsg)에서 직접 받음(master 경유 없이 단독 테스트용).
-add_executable(debug_node src/debug_node.cpp src/fsm.cpp)
-target_include_directories(debug_node PRIVATE include)
-target_link_libraries(debug_node ik_lib)
-ament_target_dependencies(debug_node
-  rclcpp
-  rclcpp_lifecycle
-  std_msgs
-  sensor_msgs
-  dynamixel_hardware_msgs
-  irc_humanoid_interfaces
-)
-
 # --- C++ 디버그 IK 노드: scripts/debug_ik_node.py 포팅. ik_lib(ik_step + CollisionChecker)로
-# IK를 계산하고, debug_node.cpp와 같은 방식으로 /dynamixel_control에 직접 publish함.
+# IK를 계산하고, /dynamixel_control에 직접 publish함.
 add_executable(debug_ik_node src/debug_ik_node.cpp)
 target_include_directories(debug_ik_node PRIVATE include)
 target_link_libraries(debug_ik_node ik_lib)
@@ -92,9 +78,10 @@ ament_target_dependencies(master_node
   std_msgs
   geometry_msgs
   irc_humanoid_interfaces
+  dynamixel_hardware_msgs
 )
 
-install(TARGETS main_node debug_node debug_ik_node master_node
+install(TARGETS main_node debug_ik_node master_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -121,8 +108,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_collision_model test/test_collision_model.cpp)
   target_link_libraries(test_collision_model ik_lib)
 
-  # fsm.cpp는 ik_lib에 속하지 않고(main_node/debug_node가 각자 컴파일해 넣는 소스)
-  # ik_lib 헤더에만 의존하므로, 테스트도 fsm.cpp를 직접 소스로 넣고 ik_lib에 링크함.
+  # fsm.cpp는 ik_lib에 속하지 않고(main_node가 각자 컴파일해 넣는 소스) ik_lib
+  # 헤더에만 의존하므로, 테스트도 fsm.cpp를 직접 소스로 넣고 ik_lib에 링크함.
   ament_add_gtest(test_fsm test/test_fsm.cpp src/fsm.cpp)
   target_include_directories(test_fsm PRIVATE include)
   target_link_libraries(test_fsm ik_lib)

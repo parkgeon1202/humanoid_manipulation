@@ -1,4 +1,4 @@
-#include "ik/place_trajectory.hpp"
+#include "ik/trajectory_generator.hpp"
 
 #include <algorithm>
 
@@ -71,7 +71,7 @@ double Trajectory1D::result(double t) const
   return pos;
 }
 
-void PlaceTrajectory::put_point(double time, double x, double y, double z,
+void TrajectoryGenerator::put_point(double time, double x, double y, double z,
                                  double vx, double vy, double vz,
                                  double ax, double ay, double az)
 {
@@ -80,14 +80,14 @@ void PlaceTrajectory::put_point(double time, double x, double y, double z,
   traj_z_.put_point(time, z, vz, az);
 }
 
-void PlaceTrajectory::clear()
+void TrajectoryGenerator::clear()
 {
   traj_x_.clear();
   traj_y_.clear();
   traj_z_.clear();
 }
 
-Eigen::Vector3d PlaceTrajectory::result(double t) const
+Eigen::Vector3d TrajectoryGenerator::result(double t) const
 {
   return Eigen::Vector3d(traj_x_.result(t), traj_y_.result(t), traj_z_.result(t));
 }

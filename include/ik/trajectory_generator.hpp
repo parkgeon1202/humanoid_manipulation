@@ -5,8 +5,10 @@
 
 #include <Eigen/Dense>
 
-// place 단계에서 손 끝 목표(target_pos_)를 시간에 따라 미리 그려둔 경로를 따라
-// 이동시키기 위한 경유점 보간 모듈. IKwalk의 walk_pattern.hpp(foot_trajectory) +
+// 손 끝 목표(target_pos_)를 시간에 따라 미리 그려둔 경로를 따라 이동시키기 위한
+// 경유점 보간 모듈 - place_trajectory_(VIRTUAL_PLACE/COMPLETE_PLACE)와
+// pick_approach_trajectory_(PICK) 둘 다 이 TrajectoryGenerator를 씀(place 전용이
+// 아니라서 이름에 "place"를 안 넣음). IKwalk의 walk_pattern.hpp(foot_trajectory) +
 // kick_module.hpp(kick_trajectory) 패턴을 그대로 포팅함 - 경유점(time, pos, vel, acc)을
 // put_point로 순서대로 추가하면 인접한 두 점 사이를 5차 다항식으로 이어 붙여
 // 위치/속도/가속도가 연속인 궤적을 만든다.
@@ -21,8 +23,8 @@ public:
 
   // 경유점이 하나뿐이면 그 값을 그대로 돌려주고(대기), t가 등록된 시간 범위를
   // 벗어나면 양 끝 경유점 값으로 고정함(walk_pattern.hpp의 foot_trajectory와 달리
-  // duration 이후에도 계속 호출되는 걸 전제 - place는 정해진 duration 없이 IK가
-  // 수렴할 때까지 매 틱 result()를 호출하므로 범위 밖 t에서도 값이 안정적이어야 함).
+  // duration 이후에도 계속 호출되는 걸 전제 - IK가 수렴할 때까지 매 틱 result()를
+  // 호출하므로 범위 밖 t에서도 값이 안정적이어야 함).
   double result(double t) const;
 
 private:
@@ -48,7 +50,7 @@ private:
 };
 
 // x, y, z 3축을 각각 독립된 Trajectory1D로 관리하는 손 끝 목표 궤적.
-class PlaceTrajectory
+class TrajectoryGenerator
 {
 public:
   void put_point(double time, double x, double y, double z,

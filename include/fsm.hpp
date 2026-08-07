@@ -11,7 +11,7 @@
 
 #include "ik/collision_model.hpp"
 #include "ik/ik_solver.hpp"
-#include "ik/place_trajectory.hpp"
+#include "ik/trajectory_generator.hpp"
 
 // Pick 단계가 전부 끝나야 Place 단계로 넘어감.
 enum class Phase
@@ -35,7 +35,7 @@ enum class PlaceState
   COMPLETE_PLACE
 };
 
-// main_node.cpp/debug_node.cpp가 이 결과 하나만 보고 기계적으로 ROS 액션을 실행함
+// main_node.cpp가 이 결과 하나만 보고 기계적으로 ROS 액션을 실행함
 // (publish/모션 재생/deactivate) - 판단은 전부 ManipulationFSM 안에서 끝내고, 이
 // 구조체엔 "무엇을 해야 하는지"와 "지금 상태가 뭔지"(로깅용)만 담음.
 struct FsmAction
@@ -48,6 +48,9 @@ struct FsmAction
   std::unordered_map<std::string, double> motor_goal_positions;
   std::optional<int32_t> play_motion_number;  // set이면 motion_operator publish
   bool deactivate_and_notify = false;  // deactivate() + activate_cmd(false) publish
+  // true면 카메라를 레벨(tilt=0)로 되돌리는 PanTilt를 한 번 publish(pan은 안 건드림) -
+  // 모션 75(DONE 재활성화 진입 모션) 종료 시점(onMotionEndImpl)에만 세팅됨.
+  bool reset_pan_tilt_level = false;
 
   Phase phase = Phase::PICK;
   PickState pick_state = PickState::SIT;
@@ -73,6 +76,10 @@ struct IkTuning
   // model.nq(8) 크기로 이미 채워서 전달(호출부가 4개 입력값을 torso+왼팔 인덱스에
   // 채우고 나머지를 중립값으로 채우는 패딩을 담당 - debug_ik_node.cpp와 동일 패턴).
   Eigen::VectorXd joint_weights;
+  // PLACE(VIRTUAL_PLACE) 전용 joint_weights - PICK과 반대로 torso_yaw를 더 아끼고
+  // (허리를 덜 쓰고) 팔 위주로 풀게 하려는 용도. stepReachableIk는 phase에 맞는
+  // 쪽을 state_changed 시점에 active_joint_weights_로 스냅샷해서 씀(solveTickImpl 참고).
+  Eigen::VectorXd place_joint_weights;
   double joint_weight_scale = 0.0;
   // EE 위치 오차 항(가중치 1)과 견줄 만큼 secondary_dq(그리퍼 방향 정렬)도 중요하게
   // 다루려고 기존 충돌회피용 기본값(0.01)보다 훨씬 크게 잡음(실기에서 더 튜닝 필요).
@@ -142,6 +149,13 @@ struct IkTuning
   // 비전 y값의 실측 오프셋(m) - PICK_READY의 torso_yaw 편향 방향 결정 시
   // target_pos_.y()에서 이 값을 뺀 보정값(corrected_y)을 씀(stepPickReady 참고).
   double vision_y_offset = 0.0328;
+
+  // PICK 접근 궤적(pick_approach_trajectory_): PICK_READY -> PICK 전이 직전(q_ 4개가
+  // 다 확정된 시점)의 EE 위치 -> target_pos_ 2점만으로 잇는 5차(quintic) 경로 -
+  // place_trajectory_와 달리 회피할 장애물이 없어 정점 없이 직행. 양 끝 vel=acc=0
+  // (TrajectoryGenerator::put_point 기본값)이라 minimum-jerk 프로파일로 부드럽게
+  // 출발/도착함(진짜 3차는 아니고 Trajectory1D가 항상 쓰는 quintic 그대로 재사용).
+  double pick_approach_duration_sec = 1.0;
 };
 
 class ManipulationFSM
@@ -153,7 +167,7 @@ public:
 
   // collision_checker_가 robot_model_을 참조(RobotModel&)로 들고 있어서(ik/collision_model.hpp
   // 참고) 복사/이동하면 그 참조가 옛 메모리를 가리키게 됨(dangling) - 아예 막아서
-  // 실수로 값 전달/return-by-value 하면 컴파일 에러가 나게 함(main_node.cpp/debug_node.cpp는
+  // 실수로 값 전달/return-by-value 하면 컴파일 에러가 나게 함(main_node.cpp는
   // std::unique_ptr<ManipulationFSM>로 들고 있어서 이 제약과 무관함).
   ManipulationFSM(const ManipulationFSM &) = delete;
   ManipulationFSM & operator=(const ManipulationFSM &) = delete;
@@ -179,7 +193,7 @@ public:
 
   // motor_status 콜백에서 모터 하나의 현재 위치/속도를 갱신. motor_id는 "1", "10"
   // 처럼 모터 번호를 문자열로 넣음. 판단은 안 하고 그대로 저장만 함(판단은
-  // on_motor_feedback()이 함) - main_node.cpp/debug_node.cpp를 최대한 얇게 유지하기 위함.
+  // on_motor_feedback()이 함) - main_node.cpp를 최대한 얇게 유지하기 위함.
   // 메시지 콜백 스레드(쓰기)와 solve_tick 스레드(읽기)가 동시에 접근하므로 함수
   // 내부에서 data_mutex_로 짧게 보호함(호출부는 락을 신경 쓸 필요 없음).
   void set_motor_position(const std::string & motor_id, double position);
@@ -188,6 +202,14 @@ public:
   // motor_id로 등록해둔 최근 위치/속도를 조회. 값을 한 번도 못 받은 id면 0.0.
   double motor_position(const std::string & motor_id) const;
   double motor_velocity(const std::string & motor_id) const;
+
+  // 목(pan/tilt) 모터 전용 - kMotorIdOrder에 없어서(tilt는 이 시스템에서 모터로
+  // 제어 안 함) motor_positions_/motor_velocities_ 맵에 안 들어가고, main_node.cpp가
+  // CurrentMotorStatus.position/velocity의 마지막 원소(tilt 실측값)를 여기로 따로
+  // 넣어줌. VIRTUAL_PLACE 진입 시 카메라가 레벨(tilt=0)로 실제로 돌아왔는지 확인하는
+  // 용도(isTiltSettled() 참고).
+  void set_tilt_position(double position);
+  void set_tilt_velocity(double velocity);
 
   // IK 등에서 계산한 모터 목표 위치(rad)를 등록/조회. solve_tick 스레드에서만
   // 쓰여서(로직 메서드 전용) 별도 락 없음.
@@ -211,13 +233,14 @@ public:
   std::optional<bool> take_pending_motion_end();
 
   // 현재 상태에 진입할 때 재생해야 하는 모션 번호(motion_operator의 motion_num).
-  // SIT=73, COMPLETE_GRIP=74, DONE(picking 끝나고 place용으로 재활성화됐을 때)=75.
-  // 재생할 모션이 없는 상태면 std::nullopt.
+  // SIT=73, COMPLETE_GRIP=74, DONE(picking 끝나고 place용으로 재활성화됐을 때)=75,
+  // COMPLETE_PLACE(역재생 IK가 시작점까지 수렴 + settle된 뒤 전신을 최종 자세로
+  // 되돌림)=76. 재생할 모션이 없는 상태면 std::nullopt.
   std::optional<int32_t> entry_motion_number() const;
 
   std::string to_string() const;
 
-  // --- 아래 4개가 main_node.cpp/debug_node.cpp가 실제로 호출하는 진입점(전부
+  // --- 아래 4개가 main_node.cpp가 실제로 호출하는 진입점(전부
   // xxxImpl()로 action_을 갱신한 뒤 finalize()로 마무리하는 얇은 wrapper) ---
 
   // on_activate() 직후 1회 호출(SIT 진입 모션, 또는 DONE 상태에서 place용으로
@@ -261,11 +284,23 @@ private:
 
   // has_pending_vision_/vision_x_/y_/z_ 읽기+캡처+클리어를 data_mutex_ 안에서
   // 원자적으로 처리 - update_vision()이 다른 스레드에서 이 필드들을 쓸 수 있어서.
-  // 대기 중인 값이 있으면 *out에 채우고 pending 플래그를 지운 뒤 true, 없으면 false.
-  bool tryCapturePendingVision(Eigen::Vector3d * out);
+  // 논블로킹: pending 값이 있으면 하나만 소비해 vision_sample_sum_/count_(멤버,
+  // tick 간 유지)에 누적하고, 아직 kVisionSampleTarget(10)개를 못 모았으면 false를
+  // 돌려줌 - 호출부(solve_tick)는 다음 tick에 새 pending 값이 들어오면 다시 시도하는
+  // 기존 재시도 패턴을 그대로 씀. 다 모으면 평균을 *out에 채우고 누적 상태를 리셋한
+  // 뒤 true를 돌려줌(첫 pending 값조차 없으면 즉시 false). x/y/z 셋 다 0.0 또는 셋
+  // 다 kVisionInvalidSentinel(-0.999)인 통짜 센티널(탐지 실패)은 항상 버림.
+  // check_magnitude_bound가 true면(공/PICK_READY 전용) 거기에 더해 |x|,|y|,|z|가
+  // 셋 다 kVisionMagnitudeBound(0.33)를 넘는 표본도 버림 - 골대/VIRTUAL_PLACE
+  // 캡처는 false로 호출해서 이 범위 제한 없이 센티널 필터만 적용함.
+  bool tryCapturePendingVision(Eigen::Vector3d * out, bool check_magnitude_bound);
 
-  // PICK_READY state_changed 시점처럼, 이전 시도 중에 받아둔 낡은 비전 값을 이번
-  // 시도의 캡처값으로 쓰지 않게 미리 버림(data_mutex_로 보호).
+  // vision_sample_sum_/count_를 0으로 리셋(data_mutex_로 보호) - 새 캡처 시도를
+  // 시작하기 전, 이전 시도에서 일부만 모으고 중단된 누적값을 이어받지 않게 함.
+  void resetVisionSampleAccumulator();
+
+  // PICK_READY/VIRTUAL_PLACE state_changed 시점처럼, 이전 시도 중에 받아둔 낡은
+  // 비전 값을 이번 시도의 캡처값으로 쓰지 않게 미리 버림(data_mutex_로 보호).
   void discardPendingVision();
 
   bool checkGripMotorStopped(double motor6_velocity);
@@ -274,6 +309,11 @@ private:
   bool isSettled(const std::string & motor_id, double target_rad) const;
   // motor_id -> 목표 위치(rad) 목록을 받아서 전부 isSettled()를 만족하는지 확인.
   bool allSettled(const std::vector<std::pair<std::string, double>> & targets) const;
+  // isSettled()와 동일한 판정(속도+위치 임계값)을 tilt_position_/tilt_velocity_에
+  // 대해 목표 0.0(레벨)로 확인 - motor_positions_ 맵을 안 쓰는 tilt 전용이라 별도로
+  // 뺌. 모션 재생(motion_in_flight_)과 무관하게(목 모터는 motion_operator가 아니라
+  // /RealsensePanTilt로만 구동됨) 항상 판정함.
+  bool isTiltSettled() const;
 
   // solve_tick()이 위임하는 phase/state별 처리. state_changed는 "지난 solve_tick()
   // 호출 이후로 phase/pick_state/place_state가 바뀌었는지"(자체 감지, 별도 신호 불필요).
@@ -299,6 +339,10 @@ private:
   bool grip_motor_was_moving_ = false;
   int grip_stopped_streak_ = 0;
 
+  // set_tilt_position()/set_tilt_velocity() 참고 - 목(tilt) 모터 실측값 전용.
+  double tilt_position_ = 0.0;
+  double tilt_velocity_ = 0.0;
+
   bool has_pending_vision_ = false;
   double vision_x_ = 0.0;
   double vision_y_ = 0.0;
@@ -314,17 +358,50 @@ private:
   IkTuning ik_tuning_;
 
   Eigen::VectorXd q_;
+  // stepReachableIk가 실제로 쓰는 joint_weights - PICK/PLACE 진입(state_changed)
+  // 시점에 ik_tuning_.joint_weights/place_joint_weights 중 해당하는 걸로 덮어씀.
+  Eigen::VectorXd active_joint_weights_;
+  // stepReachableIk가 실제로 쓰는 joint_weight_scale - PICK/VIRTUAL_PLACE 진입 시
+  // ik_tuning_.joint_weight_scale로 세팅되지만, COMPLETE_PLACE 역재생(stepCompletePlaceHoming)
+  // 진입 시엔 0.0으로 덮어씀(그냥 되돌아가는 구간이라 조인트 사용량을 아낄 필요가
+  // 없어서 - active_joint_weights_와 동일 패턴).
+  double active_joint_weight_scale_ = 0.0;
   double damping_ = ik::kDefaultDamping;
   Eigen::Vector3d target_pos_ = Eigen::Vector3d::Zero();
   bool has_captured_target_ = false;
+  // VIRTUAL_PLACE 전용: isTiltSettled()가 처음 true가 되는 tick에 discardPendingVision()을
+  // 한 번만 부르기 위한 플래그(solveTickImpl 참고) - tilt가 settle되는 동안 카메라가
+  // 아직 이전 각도로 찍은 값이 vision_x_/y_/z_에 남아있다가 그대로 첫 표본으로 섞여
+  // 들어가는 문제(실측 확인됨: 10개 중 1개만 나머지와 동떨어진 값)가 있었음.
+  bool tilt_settle_vision_discarded_ = false;
+  // tryCapturePendingVision이 논블로킹으로 모으는 비전 표본 개수(노이즈를 줄이려고
+  // 평균냄).
+  static constexpr int kVisionSampleTarget = 10;
+  // tryCapturePendingVision이 tick 간에 이어서 누적하는 상태 - resetVisionSampleAccumulator()로
+  // 새 캡처 시도 시작 전에 리셋해야 함(data_mutex_로 보호).
+  Eigen::Vector3d vision_sample_sum_ = Eigen::Vector3d::Zero();
+  int vision_sample_count_ = 0;
+  // vision_sample_sum_과 동시에 채워지는 개별 표본(디버그 로그 전용) - kVisionSampleTarget개가
+  // 다 모여 평균을 낼 때 전부 로그로 찍은 뒤 비움(resetVisionSampleAccumulator()에서도 비움).
+  std::vector<Eigen::Vector3d> vision_samples_;
   // stepPickReady 전용: 팔이 home_q_full ready 자세에 settle되고 비전도 캡처된
   // 뒤에야 torso_yaw 편향(+-pick_ready_torso_bias_rad) 명령을 한 번 내보내고
   // true로 세팅 - 그 뒤로는 torso가 그 값에 실제로 도달했는지만 확인함.
   bool torso_bias_commanded_ = false;
 
+  // PICK 전용: stepPickReady가 PICK_READY -> PICK 전이 직전(advance() 호출 바로
+  // 앞)에 시작(EE)->target_pos_ 2점으로 한 번 만들어두고, PICK 상태(solveTickImpl)가
+  // 매 틱 이 궤적의 result(pick_approach_traj_time_)를 target_pos_로 갱신해서
+  // stepReachableIk에 흘려보냄(place_trajectory_와 동일 패턴, IkTuning::pick_approach_duration_sec 참고).
+  ik::TrajectoryGenerator pick_approach_trajectory_;
+  double pick_approach_traj_time_ = 0.0;
+
   // VIRTUAL_PLACE 전용: target_pos_를 매 틱 이 궤적의 result(place_traj_time_)로 갱신해서
   // 기존 ikStep 루프에 그대로 흘려보냄(경유점은 stepReachableIk 진입 전에 구성).
-  ik::PlaceTrajectory place_trajectory_;
+  // COMPLETE_PLACE(stepCompletePlaceHoming)가 같은 place_trajectory_를 place_traj_time_을
+  // duration에서 0으로 거꾸로 흘려보내며 재사용 - 놓으러 갈 때 지나간 장애물 회피
+  // 아크를 그대로 되짚어 돌아오게 함(clear()는 다음 VIRTUAL_PLACE 재진입 때만 호출됨).
+  ik::TrajectoryGenerator place_trajectory_;
   double place_traj_time_ = 0.0;
   bool ik_converged_ = false;
   int stuck_streak_ = 0;
