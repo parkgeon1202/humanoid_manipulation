@@ -80,6 +80,10 @@ struct IkTuning
   // (허리를 덜 쓰고) 팔 위주로 풀게 하려는 용도. stepReachableIk는 phase에 맞는
   // 쪽을 state_changed 시점에 active_joint_weights_로 스냅샷해서 씀(solveTickImpl 참고).
   Eigen::VectorXd place_joint_weights;
+  // COMPLETE_PLACE(역재생 홈잉) 전용 joint_weights - stepCompletePlaceHoming
+  // state_changed에서 active_joint_weights_로 스냅샷됨. torso_yaw를 크게 아껴서
+  // (기본 100) 돌아올 때 허리 대신 팔 위주로 풀게 함.
+  Eigen::VectorXd complete_place_joint_weights;
   double joint_weight_scale = 0.0;
   // EE 위치 오차 항(가중치 1)과 견줄 만큼 secondary_dq(그리퍼 방향 정렬)도 중요하게
   // 다루려고 기존 충돌회피용 기본값(0.01)보다 훨씬 크게 잡음(실기에서 더 튜닝 필요).
@@ -109,6 +113,15 @@ struct IkTuning
 
   double gripper_open_rad = 0.0;
   double gripper_closed_rad = 0.0;
+  // VIRTUAL_PLACE에서 물건을 놓을 때 벌리는 목표(stepReachableIk 참고) - PICK_READY
+  // 진입 시 미리 벌려두는 gripper_open_rad와 별개 값. 그냥 집을 때보다 확실히
+  // 떨어뜨리려면 더 크게 벌려야 할 수 있어서 따로 뺌.
+  double place_gripper_open_rad = 0.0;
+  // VIRTUAL_PLACE에서 그리퍼를 벌릴 때 left_shoulder_pitch도 그 순간 실측값 기준으로
+  // 이만큼(rad) 같이 돌림(stepReachableIk 참고) - 그리퍼 모터와 연결된 프레임이
+  // 놓는 자세에서 그리퍼 아래쪽으로 가버려서 모터만 돌아가고 실제로는 안 놓아지는
+  // 문제 대응(어깨를 더 돌려서 프레임 위치를 바꿔줌).
+  double place_release_shoulder_pitch_offset_rad = 0.0;
 
   // 정체 킥 때 어깨 롤을 이 각도로 리셋함(elbow_kick_rad/left_shoulder_pitch_kick_rad와
   // 짝, kick 전용).
@@ -145,6 +158,12 @@ struct IkTuning
   double place_apex_x = 0.1;
   double place_apex_y = 0.3;
   double place_traj_duration_sec = 3.0;  // 시작->정점->목표 전체 소요 시간(초)
+
+  // VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, stepReachableIk 참고) - 늘고 주는 방향을
+  // 따로 둠. 못 수렴할 때는 빨리 풀어주고(기본 6mm), 수렴할 때는 더 조심스럽게
+  // 조여가려고(기본 3mm) 늘리는 쪽을 더 크게 잡음.
+  double place_tol_increase_step_m = 0.006;
+  double place_tol_decrease_step_m = 0.003;
 
   // 비전 y값의 실측 오프셋(m) - PICK_READY의 torso_yaw 편향 방향 결정 시
   // target_pos_.y()에서 이 값을 뺀 보정값(corrected_y)을 씀(stepPickReady 참고).
@@ -190,6 +209,15 @@ public:
   PlaceState place_state() const;
 
   bool is_sequence_complete() const;
+
+  // RViz 시각화 전용(main_node.cpp가 매 tick 그대로 publish) - solve_tick 스레드에서만
+  // 쓰여서(다른 로직 전용 상태와 동일 이유) 별도 락 없음.
+  // 현재 IK가 쫓고 있는 목표점(target_pos_) - 아직 캡처 전이면 Zero().
+  Eigen::Vector3d target_pos() const;
+  // 지금 활성 상태(PICK.PICK면 pick_approach_trajectory_, PLACE.VIRTUAL_PLACE면
+  // place_trajectory_)의 경로를 [0, duration] 구간에서 균등 샘플링해서 돌려줌 - 그
+  // 외 상태면 활성 궤적이 없으므로 빈 벡터. num_samples는 양 끝점 포함 개수(2 이상).
+  std::vector<Eigen::Vector3d> sample_active_trajectory(int num_samples = 30) const;
 
   // motor_status 콜백에서 모터 하나의 현재 위치/속도를 갱신. motor_id는 "1", "10"
   // 처럼 모터 번호를 문자열로 넣음. 판단은 안 하고 그대로 저장만 함(판단은
@@ -318,7 +346,13 @@ private:
   // solve_tick()이 위임하는 phase/state별 처리. state_changed는 "지난 solve_tick()
   // 호출 이후로 phase/pick_state/place_state가 바뀌었는지"(자체 감지, 별도 신호 불필요).
   void stepPickReady(bool state_changed);
-  void stepReachableIk(bool opening_gripper);
+  // opening_gripper: 수렴 후 그리퍼를 열고 advance()할지(VIRTUAL_PLACE만 true).
+  // use_place_tol: place_tol_(유동)을 쓸지 - place_trajectory_를 쫓는 VIRTUAL_PLACE
+  // 진행/COMPLETE_PLACE 역재생 둘 다 true, pick_approach_trajectory_를 쫓는 PICK만
+  // false(ik_tuning_.tol 고정). opening_gripper와 별개 축이라 따로 뺌 - COMPLETE_PLACE는
+  // place_trajectory_를 되짚어가면서도 그리퍼는 안 건드려야 해서 opening_gripper=false,
+  // use_place_tol=true 조합이 필요함.
+  void stepReachableIk(bool opening_gripper, bool use_place_tol = false);
   void stepCompleteGripHoming(bool state_changed);
   void stepDoneHoming(bool state_changed);
   void stepCompletePlaceHoming(bool state_changed);
@@ -405,6 +439,18 @@ private:
   double place_traj_time_ = 0.0;
   bool ik_converged_ = false;
   int stuck_streak_ = 0;
+  // VIRTUAL_PLACE 전용(stepReachableIk 참고) - ik_tuning_.tol을 그대로 안 쓰고
+  // 이 값을 params.tol로 씀(PICK은 ik_tuning_.tol 그대로). kPlaceTolInitialM(3mm)로
+  // 시작해서, 연속 10번 수렴하면 kPlaceTolStepM(3mm)씩 조이되(하한 ik_tuning_.tol),
+  // 연속 10번 미수렴하면 3mm씩 풀어줌(상한 없음).
+  double place_tol_ = 0.0;  // 0.0이면 "아직 초기화 안 됨" - state_changed에서 세팅.
+  int place_tol_success_streak_ = 0;
+  int place_tol_fail_streak_ = 0;
+  // VIRTUAL_PLACE 놓기 전용(stepReachableIk 참고) - 그리퍼를 벌리기 시작하는 순간
+  // 딱 한 번만 그 시점 실측 left_shoulder_pitch + offset을 q_[kLeftArmIndices[0]]에
+  // 바로 대입해서 고정해둠(매 tick 다시 읽으면 목표 자체가 계속 움직여서 isSettled가
+  // 영영 안 됨) - 목표값 자체는 q_ 안에 있으므로 별도 필드로 안 둠.
+  bool place_release_shoulder_pitch_commanded_ = false;
   bool kick_settling_ = false;
   double gripper_position_ = 0.0;
 

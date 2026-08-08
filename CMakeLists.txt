@@ -53,6 +53,7 @@ ament_target_dependencies(main_node
   geometry_msgs
   dynamixel_hardware_msgs
   irc_humanoid_interfaces
+  visualization_msgs
 )
 
 # --- C++ 디버그 IK 노드: scripts/debug_ik_node.py 포팅. ik_lib(ik_step + CollisionChecker)로

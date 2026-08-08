@@ -38,6 +38,14 @@ constexpr double kVisionMagnitudeBound = 0.33;
 // 정규화가 남은 오차를 줄이는 걸 방해한다고 보고 0.0으로 꺼버림.
 constexpr double kPickNearTargetDistanceM = 0.02;
 constexpr double kPickStalledJointVelocityRadPerSec = 0.1;
+
+// VIRTUAL_PLACE 전용 place_tol_ 초기값(m)과 조정 연속 횟수 기준 - 조정 폭 자체는
+// IkTuning::place_tol_increase_step_m/decrease_step_m(main_node.yaml에서 설정) 참고.
+constexpr double kPlaceTolInitialM = 0.003;
+constexpr int kPlaceTolAdjustStreakTicks = 10;
+// place_tol_이 아무리 계속 못 수렴해도 이 이상은 안 풀어줌(관절 한계 등으로 영영
+// 도달 불가능한 목표를 만나도 오차 허용치가 끝없이 커지는 걸 막는 안전판).
+constexpr double kPlaceTolMaxM = 0.10;
 }  // namespace
 
 ManipulationFSM::ManipulationFSM(const std::string & urdf_path, const std::string & ee_frame)
@@ -119,6 +127,36 @@ PlaceState ManipulationFSM::place_state() const
 bool ManipulationFSM::is_sequence_complete() const
 {
   return phase_ == Phase::PLACE && place_state_ == PlaceState::COMPLETE_PLACE;
+}
+
+Eigen::Vector3d ManipulationFSM::target_pos() const
+{
+  return target_pos_;
+}
+
+std::vector<Eigen::Vector3d> ManipulationFSM::sample_active_trajectory(int num_samples) const
+{
+  std::vector<Eigen::Vector3d> samples;
+  const ik::TrajectoryGenerator * traj = nullptr;
+  double duration = 0.0;
+  if (phase_ == Phase::PICK && pick_state_ == PickState::PICK) {
+    traj = &pick_approach_trajectory_;
+    duration = ik_tuning_.pick_approach_duration_sec;
+  } else if (phase_ == Phase::PLACE && place_state_ == PlaceState::VIRTUAL_PLACE) {
+    traj = &place_trajectory_;
+    duration = ik_tuning_.place_traj_duration_sec;
+  } else {
+    return samples;  // 그 외 상태는 활성 궤적이 없음 - 빈 벡터.
+  }
+  if (num_samples < 2) {
+    return samples;
+  }
+  samples.reserve(num_samples);
+  for (int i = 0; i < num_samples; ++i) {
+    const double t = duration * static_cast<double>(i) / static_cast<double>(num_samples - 1);
+    samples.push_back(traj->result(t));
+  }
+  return samples;
 }
 
 //해쉬테이블에 모터 하나씩 등록함
@@ -661,6 +699,11 @@ void ManipulationFSM::solveTickImpl()
     if (state_changed) {
       damping_ = ik_tuning_.default_damping;
       stuck_streak_ = 0;
+      // place_tol_ 참고 - 매번 새 VIRTUAL_PLACE 시도는 항상 kPlaceTolInitialM부터 다시 시작.
+      place_tol_ = kPlaceTolInitialM;
+      place_tol_success_streak_ = 0;
+      place_tol_fail_streak_ = 0;
+      place_release_shoulder_pitch_commanded_ = false;
       kick_settling_ = false;
       ik_converged_ = false;
       has_captured_target_ = false;
@@ -724,24 +767,25 @@ void ManipulationFSM::solveTickImpl()
         start_pos.z() + vz * duration * 0.3,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
       place_trajectory_.put_point(
-        duration * 0.5, target_pos_.x()*0.99, target_pos_.y() + ik_tuning_.place_apex_y,
+        duration * 0.5, target_pos_.x()*0.99-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
         start_pos.z() + vz * duration * 0.8,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
       place_trajectory_.put_point(
-        duration * 0.7, target_pos_.x(), target_pos_.y() + ik_tuning_.place_apex_y,
+        duration * 0.7, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
         start_pos.z() + vz * duration * 1.0,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
       place_trajectory_.put_point(
-        duration * 0.8, target_pos_.x(), target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration +  0.1,
+        duration * 0.8, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration +  0.05,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
       place_trajectory_.put_point(
-        duration * 0.9, target_pos_.x(), target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration + 0.1,
+        duration * 0.9, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
+        start_pos.z() + vz * duration + 0.05,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
 
       place_trajectory_.put_point(
-        duration, target_pos_.x(), target_pos_.y(), start_pos.z() + vz * duration + 0.1,
+        duration, target_pos_.x()-0.05, target_pos_.y(),
+        start_pos.z() + vz * duration + 0.05,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
     }
     // 궤적이 아직 끝나지 않았으면(목표 지점 도달 전) target_pos_가 매 tick 계속
@@ -756,7 +800,7 @@ void ManipulationFSM::solveTickImpl()
     if (trajectory_in_progress) {
       ik_converged_ = false;
     }
-    stepReachableIk(/*opening_gripper=*/true);
+    stepReachableIk(/*opening_gripper=*/true, /*use_place_tol=*/true);
     return;
   }
   
@@ -858,10 +902,20 @@ void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
     ik_converged_ = false;
     damping_ = ik_tuning_.default_damping;
     stuck_streak_ = 0;
+    // VIRTUAL_PLACE 갈 때 풀려있던 값을 그대로 이어받지 않고 COMPLETE_PLACE도 항상
+    // kPlaceTolInitialM(3mm)부터 다시 시작 - place_tol_은 상한(kPlaceTolMaxM)까지는
+    // 있어도 하한 없이 갈 때 계속 커질 수 있어서, 그 느슨해진 값 그대로 물려받으면
+    // 실제로는 안 쫓아가면서 "수렴함"으로 착각하는 구간이 생김(t=0에서 갑자기 크게
+    // 튀는 문제의 원인 - fsm.cpp 관련 대화 참고).
+    place_tol_ = kPlaceTolInitialM;
+    place_tol_success_streak_ = 0;
+    place_tol_fail_streak_ = 0;
     kick_settling_ = false;
-    // 그냥 놓았던 자리로 되짚어 돌아가는 구간이라 조인트 사용량을 아낄 이유가
-    // 없음 - joint_weight_scale 정규화를 꺼서(0.0) IK가 더 자유롭게/빠르게 풀게 함.
-    active_joint_weight_scale_ = 0.0;
+    // 되짚어 돌아가는 구간도 torso_yaw는 아껴 쓰게(complete_place_joint_weights,
+    // 기본 [100,1,1,1]) 함 - 그러려면 joint_weight_scale 정규화가 꺼져있으면(0.0)
+    // 가중치 자체가 무의미해지므로 여기선 켬(ik_tuning_.joint_weight_scale).
+    active_joint_weights_ = ik_tuning_.complete_place_joint_weights;
+    active_joint_weight_scale_ = ik_tuning_.joint_weight_scale;
   }
 
   // 모션(76)이 재생 중이면 SIT/DONE/COMPLETE_GRIP 진입 모션과 동일하게 완전히
@@ -874,7 +928,7 @@ void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
   }
 
   // place_traj_time_이 아직 0 위(reverse_in_progress)거나, 0에 도달했어도 마지막
-  // 목표(start_pos)로 IK가 아직 실제로 수렴 안 했으면(!ik_converged_) 계속 추적.
+  // 목표(start_pos)로 IK가 아직 실제로 수렴 안 했으면(!ik_converged_) 계속 추적.to
   // 게이트를 ik_converged_ 하나로만 걸면(예전 버전의 버그) reverse_in_progress인
   // 도중 중간 경유점에 스치듯 수렴해 ik_converged_가 잠깐 true가 되는 순간 다음
   // tick부터 이 블록에 아예 안 들어오게 돼서, 남은 아크(정점 등)를 못 따라가고
@@ -893,8 +947,10 @@ void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
     }
     // opening_gripper는 ik_converged_가 false인 동안 stepReachableIk 안에서 안 쓰임
     // (그 값을 읽는 분기는 전부 else if(ik_converged_) 쪽) - 그리퍼는 여기서 그대로
-    // 안 건드림.
-    stepReachableIk(/*opening_gripper=*/false);
+    // 안 건드림. use_place_tol=true는 필수 - place_trajectory_를 그대로 되짚는 구간이라
+    // VIRTUAL_PLACE가 갈 때 이미 풀어놓은 place_tol_을 이어받아야 똑같이 막혔던
+    // 지점에서 안 얼어붙음(stepReachableIk 정의부 주석 참고).
+    stepReachableIk(/*opening_gripper=*/false, /*use_place_tol=*/true);
     return;
   }
 
@@ -1022,7 +1078,7 @@ void ManipulationFSM::stepPickReady(bool state_changed)
                       /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
 }
 
-void ManipulationFSM::stepReachableIk(bool opening_gripper)
+void ManipulationFSM::stepReachableIk(bool opening_gripper, bool use_place_tol)
 {
   if (!ik_converged_) {
     if (kick_settling_) {
@@ -1046,7 +1102,9 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
         ik::eeOrientationAlignmentDq(robot_model_, q_, ik_tuning_.orientation_align_k_pull);
 
       ik::IkStepParams params;
-      params.tol = ik_tuning_.tol;
+      // place_trajectory_를 쫓는 쪽(VIRTUAL_PLACE/COMPLETE_PLACE)만 place_tol_(유동)을
+      // 씀 - PICK(pick_approach_trajectory_)은 ik_tuning_.tol 그대로(place_tol_ 필드 주석 참고).
+      params.tol = use_place_tol ? place_tol_ : ik_tuning_.tol;
       params.alpha = ik_tuning_.alpha;
       params.min_damping = ik_tuning_.min_damping;
       params.max_damping = ik_tuning_.max_damping;
@@ -1091,16 +1149,40 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
         kick_settling_ = true;
       }
 
+      // place_tol_ 유동 조정(place_trajectory_를 쫓는 쪽 전용, 필드 주석 참고) - 연속
+      // kPlaceTolAdjustStreakTicks(10)번 수렴하면 place_tol_decrease_step_m(기본
+      // 3mm)씩 조이되(하한 ik_tuning_.tol), 연속 10번 미수렴하면
+      // place_tol_increase_step_m(기본 6mm)씩 풀어줌(상한 kPlaceTolMaxM(10cm)).
+      if (use_place_tol) {
+        if (result.converged) {
+          //place_tol_fail_streak_ = 0;
+          if (++place_tol_success_streak_ >= kPlaceTolAdjustStreakTicks) {
+            place_tol_ = std::max(ik_tuning_.tol, place_tol_ - ik_tuning_.place_tol_decrease_step_m);
+            place_tol_success_streak_ = 0;
+          }
+        } else {
+          //place_tol_success_streak_ = 0;
+          if (++place_tol_fail_streak_ >= kPlaceTolAdjustStreakTicks) {
+            place_tol_ = std::min(kPlaceTolMaxM, place_tol_ + ik_tuning_.place_tol_increase_step_m);
+            place_tol_fail_streak_ = 0;
+          }
+        }
+        std::printf(
+          "[place_tol_debug] tol=%.4f converged=%d success_streak=%d fail_streak=%d\n",
+          place_tol_, result.converged ? 1 : 0, place_tol_success_streak_, place_tol_fail_streak_);
+      }
+
       if (result.converged) {
         ik_converged_ = true;
         const Eigen::Vector3d converged_ee = ik::eePosition(robot_model_, q_);
         std::printf(
           "[pick_ik_debug] target=(%.4f, %.4f, %.4f) converged_ee=(%.4f, %.4f, %.4f) "
-          "diff=(%.4f, %.4f, %.4f) q_torso=%.4f\n",
+          "diff=(%.4f, %.4f, %.4f) q_torso=%.4f tol=%.4f\n",
           target_pos_.x(), target_pos_.y(), target_pos_.z(),
           converged_ee.x(), converged_ee.y(), converged_ee.z(),
           converged_ee.x() - target_pos_.x(), converged_ee.y() - target_pos_.y(),
-          converged_ee.z() - target_pos_.z(), q_[ik::kTorsoJointIndex]);
+          converged_ee.z() - target_pos_.z(), q_[ik::kTorsoJointIndex],
+          use_place_tol ? place_tol_ : ik_tuning_.tol);
       } else if (!opening_gripper && active_joint_weight_scale_ > 0.0) {
         // PICK 전용(공을 집을 때) - 아직 tol 안으로는 안 왔지만 근처(kPickNearTargetDistanceM)까지
         // 왔는데 실측 관절 속도가 전부 정지 수준(kPickStalledJointVelocityRadPerSec 미만)이면,
@@ -1128,10 +1210,25 @@ void ManipulationFSM::stepReachableIk(bool opening_gripper)
     }
   } else if (opening_gripper) {
     // 매 tick 목표를 조금씩(step) 당기지 않고 열림 목표를 한 번에 그대로 명령함 -
-    // 실제 이동 속도/궤적은 모터 자체의 profile_velocity(아래 1.0)가 담당. 완료
-    // 판정은 소프트웨어 setpoint가 아니라 실제 모터 피드백(isSettled)으로 함.
-    gripper_position_ = ik_tuning_.gripper_open_rad;
-    if (isSettled(kGripMotorId, ik_tuning_.gripper_open_rad)) {
+    // 실제 이동 속도/궤적은 모터 자체의 profile_velocity가 담당. 완료 판정은
+    // 소프트웨어 setpoint가 아니라 실제 모터 피드백(isSettled)으로 함.
+    // place_gripper_open_rad 필드 주석 참고 - PICK_READY 진입용 gripper_open_rad와
+    // 별개 값(놓을 때 확실히 떨어뜨리려고 더 크게 벌릴 수 있음).
+    gripper_position_ = ik_tuning_.place_gripper_open_rad;
+    // place_release_shoulder_pitch_commanded_ 필드 주석 참고 - 그리퍼 모터와 연결된
+    // 프레임이 놓는 자세에서 그리퍼 아래쪽으로 가버려서 모터만 돌고 실제로는 안
+    // 놓아지는 문제 대응. 이 분기에 처음 들어온 tick에만(딱 한 번) 그 순간 실측
+    // left_shoulder_pitch + offset을 q_에 바로 대입해서 고정 - 매 tick 다시 읽으면
+    // 목표 자체가 계속 움직여서 isSettled가 영영 안 됨(IK는 이미 안 도니 그 뒤로
+    // q_가 다른 데서 안 바뀜 - 아래 set_motor_goal_position이 그대로 이 값을 씀).
+    if (!place_release_shoulder_pitch_commanded_) {
+      q_[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId) +
+        ik_tuning_.place_release_shoulder_pitch_offset_rad;
+      place_release_shoulder_pitch_commanded_ = true;
+    }
+    if (isSettled(kGripMotorId, ik_tuning_.place_gripper_open_rad) &&
+      isSettled(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]))
+    {
       advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
     }
   } else {

@@ -57,14 +57,27 @@ manipulation_node_cpp:
     # PLACE(VIRTUAL_PLACE) 전용 joint_weights - PICK과 반대로 torso_yaw를 더
     # 아끼고(허리를 덜 쓰고) 팔 위주로 풀게 함. state_changed 시점에
     # active_joint_weights_로 스냅샷돼서 stepReachableIk가 씀(solveTickImpl 참고).
-    ik.place_joint_weights: [100.0, 1.0, 1.0, 1.0]
+    ik.place_joint_weights: [1.0, 1.0, 1.0, 1.0]
+
+    # COMPLETE_PLACE(역재생 홈잉) 전용 joint_weights - torso_yaw를 크게 아껴서
+    # (100) 돌아올 때 허리 대신 팔 위주로 풀게 함. stepCompletePlaceHoming
+    # state_changed에서 active_joint_weights_로 스냅샷됨(ik.joint_weight_scale과
+    # 같이 켜져야 실제로 적용됨).
+    ik.complete_place_joint_weights: [100.0, 1.0, 1.0, 1.0]
 
     # VIRTUAL_PLACE 팔 궤적의 정점(장애물 회피용 경유점, base_link 기준 x/y, m) -
     # 시작(현재 EE)과 최종 목표(비전 캡처값) 사이에 이 지점을 거쳐가게 함.
     place.apex_x: 0.1
-    place.apex_y: 0.3
+    place.apex_y: 0.2
     # 시작->정점->목표 전체 궤적 재생 시간(초).
     place.traj_duration_sec: 10.0
+
+    # VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, stepReachableIk 참고) - 연속 10번
+    # 미수렴하면 tol_increase_step_m씩 풀어주고(상한 없음), 연속 10번 수렴하면
+    # tol_decrease_step_m씩 조여줌(하한 ik.tol). 늘어나는 쪽을 더 크게 잡아서 막히면
+    # 빨리 풀어주고, 줄어드는 쪽은 더 조심스럽게 조여감.
+    place.tol_increase_step_m: 0.02
+    place.tol_decrease_step_m: 0.002
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.
@@ -144,3 +157,10 @@ manipulation_node_cpp:
     # 닫히는 위치가 0도가 아니라 이 값이라 그대로 맞춤.
     gripper.open_deg: 25.0
     gripper.closed_deg: -36.7033
+    # VIRTUAL_PLACE에서 물건을 놓을 때 벌리는 각도(도) - gripper.open_deg(PICK_READY
+    # 진입용)와 별개. 확실히 떨어뜨리려면 더 크게 벌려야 할 수 있어서 넉넉하게 잡음.
+    gripper.place_open_deg: 65.0
+    # VIRTUAL_PLACE에서 그리퍼를 벌릴 때 left_shoulder_pitch도 그 순간 실측값 기준으로
+    # 이만큼(도) 같이 돌림 - 그리퍼 모터와 연결된 프레임이 놓는 자세에서 그리퍼
+    # 아래쪽으로 가버려서 모터만 돌고 실제로는 안 놓아지는 문제 대응.
+    gripper.place_release_shoulder_pitch_offset_deg: 30.0

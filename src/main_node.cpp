@@ -32,6 +32,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "visualization_msgs/msg/marker.hpp"
 
 using CallbackReturn =
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -43,6 +44,7 @@ using irc_humanoid_interfaces::msg::Master2VisionMsg;
 using irc_humanoid_interfaces::msg::MotionOperator;
 using rclcpp_lifecycle::State;
 using std_msgs::msg::Bool;
+using visualization_msgs::msg::Marker;
 
 namespace
 {
@@ -97,6 +99,16 @@ public:
     // BEST_EFFORT라 그대로 쓰면 reliability가 안 맞아 디스커버리부터 연결이 안 됨).
     pan_tilt_pub_ = create_publisher<Master2VisionMsg>(
       pan_tilt_topic_, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+
+    // RViz 디버그 시각화 전용(debug_ik_node.cpp의 /target_marker와 동일 토픽/규칙을
+    // 재사용해서 같은 RViz 설정을 그대로 씀) - target_pos_는 큰 구, 활성 궤적
+    // 샘플들은 작은 점들로 매 tick 갱신해서 publish함(on_solve_tick 참고).
+    // display.rviz의 TargetMarker 디스플레이가 /target_marker를 RELIABLE로 구독하게
+    // 돼 있음(depth=5) - 그대로 맞춰야 디스커버리부터 연결됨(motor_qos의 BEST_EFFORT를
+    // 그대로 쓰면 pan_tilt 때와 같은 문제가 재발함).
+    auto marker_qos = rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
+    target_marker_pub_ = create_publisher<Marker>("/target_marker", marker_qos);
+    trajectory_marker_pub_ = create_publisher<Marker>("/trajectory_marker", marker_qos);
     status_sub_ = create_subscription<CurrentMotorStatus>(
       status_topic_, motor_qos,
       [this](const CurrentMotorStatus::SharedPtr msg) {on_motor_status(msg);});
@@ -139,6 +151,8 @@ public:
     control_pub_.reset();
     gripper_pub_.reset();
     pan_tilt_pub_.reset();
+    target_marker_pub_.reset();
+    trajectory_marker_pub_.reset();
     status_sub_.reset();
     mani_sub_.reset();
     motion_operator_pub_.reset();
@@ -176,6 +190,10 @@ private:
     tuning.place_apex_x = declare_parameter<double>("place.apex_x", 0.1);
     tuning.place_apex_y = declare_parameter<double>("place.apex_y", 0.3);
     tuning.place_traj_duration_sec = declare_parameter<double>("place.traj_duration_sec", 3.0);
+    tuning.place_tol_increase_step_m =
+      declare_parameter<double>("place.tol_increase_step_m", 0.006);
+    tuning.place_tol_decrease_step_m =
+      declare_parameter<double>("place.tol_decrease_step_m", 0.003);
     tuning.pick_approach_duration_sec =
       declare_parameter<double>("pick.approach_duration_sec", 1.0);
     tuning.default_damping = declare_parameter<double>("ik.default_damping", ik::kDefaultDamping);
@@ -194,8 +212,19 @@ private:
 
     const double gripper_open_deg = declare_parameter<double>("gripper.open_deg", 30.0);
     const double gripper_closed_deg = declare_parameter<double>("gripper.closed_deg", -36.7033);
+    // place_open_deg 필드 주석 참고 - VIRTUAL_PLACE에서 놓을 때 전용, gripper.open_deg
+    // (PICK_READY 진입용)보다 더 크게 벌려야 할 수 있어서 따로 뺌.
+    const double place_gripper_open_deg =
+      declare_parameter<double>("gripper.place_open_deg", 60.0);
+    // place_release_shoulder_pitch_offset_rad 필드 주석 참고 - 놓을 때 그리퍼 모터
+    // 프레임이 아래로 가버리는 문제 대응용 어깨 pitch 추가 회전(도).
+    const double place_release_shoulder_pitch_offset_deg = declare_parameter<double>(
+      "gripper.place_release_shoulder_pitch_offset_deg", -50.0);
     tuning.gripper_open_rad = gripper_open_deg * M_PI / 180.0;
     tuning.gripper_closed_rad = gripper_closed_deg * M_PI / 180.0;
+    tuning.place_gripper_open_rad = place_gripper_open_deg * M_PI / 180.0;
+    tuning.place_release_shoulder_pitch_offset_rad =
+      place_release_shoulder_pitch_offset_deg * M_PI / 180.0;
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.
@@ -205,6 +234,8 @@ private:
       "ik.joint_weights", std::vector<double>{1.0, 1.0, 1.0, 1.0});
     const std::vector<double> place_joint_weights_4 = declare_parameter<std::vector<double>>(
       "ik.place_joint_weights", std::vector<double>{10.0, 1.0, 1.0, 1.0});
+    const std::vector<double> complete_place_joint_weights_4 = declare_parameter<std::vector<double>>(
+      "ik.complete_place_joint_weights", std::vector<double>{100.0, 1.0, 1.0, 1.0});
     tuning.joint_weight_scale = declare_parameter<double>("ik.joint_weight_scale", 0.0);
     tuning.secondary_gain = declare_parameter<double>("ik.secondary_gain", 1.0);
     tuning.orientation_align_k_pull =
@@ -244,6 +275,7 @@ private:
     tuning.home_q_full = Eigen::VectorXd::Zero(nq);
     tuning.joint_weights = Eigen::VectorXd::Ones(nq);
     tuning.place_joint_weights = Eigen::VectorXd::Ones(nq);
+    tuning.complete_place_joint_weights = Eigen::VectorXd::Ones(nq);
     if (home_q.size() >= 4) {
       tuning.home_q_full[ik::kTorsoJointIndex] = home_q[0];
       for (int i = 0; i < 3; ++i) tuning.home_q_full[ik::kLeftArmIndices[i]] = home_q[i + 1];
@@ -256,6 +288,13 @@ private:
       tuning.place_joint_weights[ik::kTorsoJointIndex] = place_joint_weights_4[0];
       for (int i = 0; i < 3; ++i) {
         tuning.place_joint_weights[ik::kLeftArmIndices[i]] = place_joint_weights_4[i + 1];
+      }
+    }
+    if (complete_place_joint_weights_4.size() >= 4) {
+      tuning.complete_place_joint_weights[ik::kTorsoJointIndex] = complete_place_joint_weights_4[0];
+      for (int i = 0; i < 3; ++i) {
+        tuning.complete_place_joint_weights[ik::kLeftArmIndices[i]] =
+          complete_place_joint_weights_4[i + 1];
       }
     }
 
@@ -330,6 +369,9 @@ private:
   // tick엔 안 돌림. on_motor_feedback이 딱히 할 게 없을 때만 solve_tick을 돌려서
   // 그 결과를 적용함(한 tick에 모터 명령이 최대 1번만 나가게).
   void on_solve_tick() {
+    // 아래 분기들이 조기 return하더라도 매 tick 빠짐없이 갱신하고 싶어서 맨 앞에서 호출.
+    publish_debug_markers();
+
     if (const std::optional<bool> pending_motion_end = fsm_->take_pending_motion_end();
       pending_motion_end.has_value())
     {
@@ -342,6 +384,55 @@ private:
       return;
     }
     apply_action(fsm_->solve_tick());
+  }
+
+  // RViz 디버그 시각화 전용 - target_pos_는 큰 구(SPHERE) 하나, 활성 궤적(PICK.PICK의
+  // pick_approach_trajectory_ 또는 PLACE.VIRTUAL_PLACE의 place_trajectory_) 샘플들은
+  // 작은 점들(POINTS, 한 Marker에 다 담음)로 publish함. 판단 없이 fsm_ 값을 그대로
+  // 옮기기만 하는 apply_action()과 동일한 성격이라 여기 같이 둠.
+  void publish_debug_markers() {
+    const auto stamp = get_clock()->now();
+    const Eigen::Vector3d target = fsm_->target_pos();
+
+    Marker target_marker;
+    target_marker.header.frame_id = "base_link";
+    target_marker.header.stamp = stamp;
+    target_marker.ns = "manipulation_target";
+    target_marker.id = 0;
+    target_marker.type = Marker::SPHERE;
+    target_marker.action = Marker::ADD;
+    target_marker.pose.position.x = target.x();
+    target_marker.pose.position.y = target.y();
+    target_marker.pose.position.z = target.z();
+    target_marker.pose.orientation.w = 1.0;
+    target_marker.scale.x = target_marker.scale.y = target_marker.scale.z = 0.08;
+    target_marker.color.r = 1.0f;
+    target_marker.color.a = 1.0f;
+    target_marker_pub_->publish(target_marker);
+
+    Marker trajectory_marker;
+    trajectory_marker.header.frame_id = "base_link";
+    trajectory_marker.header.stamp = stamp;
+    trajectory_marker.ns = "manipulation_trajectory";
+    trajectory_marker.id = 0;
+    trajectory_marker.type = Marker::POINTS;
+    // 활성 궤적이 없는 상태(빈 벡터)면 DELETE로 이전에 찍어둔 점들을 지움 - ADD에
+    // points가 비어있으면 그냥 아무것도 안 그려질 뿐 이전 마커가 안 지워짐.
+    const std::vector<Eigen::Vector3d> samples = fsm_->sample_active_trajectory(1000);
+    trajectory_marker.action = samples.empty() ? Marker::DELETE : Marker::ADD;
+    trajectory_marker.pose.orientation.w = 1.0;
+    trajectory_marker.scale.x = trajectory_marker.scale.y = 0.01;
+    trajectory_marker.color.b = 1.0f;
+    trajectory_marker.color.a = 1.0f;
+    trajectory_marker.points.reserve(samples.size());
+    for (const Eigen::Vector3d & sample : samples) {
+      geometry_msgs::msg::Point point;
+      point.x = sample.x();
+      point.y = sample.y();
+      point.z = sample.z();
+      trajectory_marker.points.push_back(point);
+    }
+    trajectory_marker_pub_->publish(trajectory_marker);
   }
 
   // fsm_가 반환한 액션을 기계적으로 ROS 액션으로 옮김 - 판단 없음. action은 이미
@@ -407,6 +498,8 @@ private:
   rclcpp::Publisher<DynamixelControlMsgs>::SharedPtr control_pub_;
   rclcpp::Publisher<DynamixelMsgs>::SharedPtr gripper_pub_;
   rclcpp::Publisher<Master2VisionMsg>::SharedPtr pan_tilt_pub_;
+  rclcpp::Publisher<Marker>::SharedPtr target_marker_pub_;
+  rclcpp::Publisher<Marker>::SharedPtr trajectory_marker_pub_;
   rclcpp::Subscription<CurrentMotorStatus>::SharedPtr status_sub_;
   rclcpp::Subscription<Point32>::SharedPtr mani_sub_;
   rclcpp::Publisher<MotionOperator>::SharedPtr motion_operator_pub_;
