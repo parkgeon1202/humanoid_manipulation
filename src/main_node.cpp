@@ -191,11 +191,17 @@ private:
     tuning.place_apex_y = declare_parameter<double>("place.apex_y", 0.3);
     tuning.place_traj_duration_sec = declare_parameter<double>("place.traj_duration_sec", 3.0);
     tuning.place_tol_increase_step_m =
-      declare_parameter<double>("place.tol_increase_step_m", 0.006);
+      declare_parameter<double>("place.tol_increase_step_m", 0.01);
     tuning.place_tol_decrease_step_m =
-      declare_parameter<double>("place.tol_decrease_step_m", 0.003);
+      declare_parameter<double>("place.tol_decrease_step_m", 0.01);
+    tuning.place_release_max_error_m =
+      declare_parameter<double>("place.release_max_error_m", 0.02);
     tuning.pick_approach_duration_sec =
       declare_parameter<double>("pick.approach_duration_sec", 1.0);
+    // complete_grip_lift_z_m 필드 주석 참고 - 집은 직후 EE를 z+로 들어올려서
+    // 안전하게 들고 있는 자세로 IK를 재수렴시키는 거리(m).
+    tuning.complete_grip_lift_z_m =
+      declare_parameter<double>("pick.complete_grip_lift_z_m", 0.1);
     tuning.default_damping = declare_parameter<double>("ik.default_damping", ik::kDefaultDamping);
     tuning.min_damping = declare_parameter<double>("ik.min_damping", ik::kMinDamping);
     tuning.max_damping = declare_parameter<double>("ik.max_damping", ik::kMaxDamping);
@@ -220,11 +226,16 @@ private:
     // 프레임이 아래로 가버리는 문제 대응용 어깨 pitch 추가 회전(도).
     const double place_release_shoulder_pitch_offset_deg = declare_parameter<double>(
       "gripper.place_release_shoulder_pitch_offset_deg", -50.0);
+    // place_release_elbow_offset_rad 필드 주석 참고 - 같은 시점에 같이 도는 팔꿈치
+    // 추가 회전(도).
+    const double place_release_elbow_offset_deg =
+      declare_parameter<double>("gripper.place_release_elbow_offset_deg", 30.0);
     tuning.gripper_open_rad = gripper_open_deg * M_PI / 180.0;
     tuning.gripper_closed_rad = gripper_closed_deg * M_PI / 180.0;
     tuning.place_gripper_open_rad = place_gripper_open_deg * M_PI / 180.0;
     tuning.place_release_shoulder_pitch_offset_rad =
       place_release_shoulder_pitch_offset_deg * M_PI / 180.0;
+    tuning.place_release_elbow_offset_rad = place_release_elbow_offset_deg * M_PI / 180.0;
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.

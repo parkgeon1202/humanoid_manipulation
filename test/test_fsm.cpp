@@ -108,46 +108,45 @@ TEST(ManipulationFsm, MotionEndAdvancesDoneToVirtualPlaceAndLatchesLegsAndOtherA
   EXPECT_NEAR(action.motor_goal_positions.at("1"), -0.17, 1e-9);
 }
 
-TEST(ManipulationFsm, PickReadySendsArmGoalImmediatelyThenWaitsArmSettleAndVision) {
+TEST(ManipulationFsm, PickReadyHoldsLatchedPositionAndCapturesVisionOnceSettled) {
   auto fsm = makeFsm();
+  // state_changed 이전에 모터가(SIT 모션이 끝난 실제 자세로) 임의 위치에 있고,
+  // 이미 그 자리에 정지해 있다고(속도 0) 가정 - 더 이상 home_q_full로 옮기지
+  // 않고 이 값을 최초 latch로 그대로 q_에 읽어와야 함.
+  fsm->set_motor_position("22", 0.2);
+  fsm->set_motor_velocity("22", 0.0);
+  fsm->set_motor_position("0", -1.0);
+  fsm->set_motor_velocity("0", 0.0);
+  fsm->set_motor_position("2", 0.4);
+  fsm->set_motor_velocity("2", 0.0);
+  fsm->set_motor_position("4", 0.9);
+  fsm->set_motor_velocity("4", 0.0);
   fsm->on_motion_end(true);  // SIT -> PICK_READY
 
-  // 1단계: state_changed 틱은 비전 여부와 무관하게 팔(shoulder_pitch/roll/elbow)
-  // ready 자세 명령을 바로 내보냄 - torso_yaw는 아직 안 건드림.
+  // 1단계: state_changed 틱은 home_q_full 프리셋이 아니라 방금 읽어 latch해둔
+  // 실측 위치를 그대로 홀드 명령으로 내보냄.
   const FsmAction tick1 = fsm->solve_tick();
   ASSERT_TRUE(tick1.publish_motor_command);
   EXPECT_EQ(tick1.state_string, "PICK.PICK_READY");
-  EXPECT_NEAR(tick1.motor_goal_positions.at("0"), -2.3, 1e-9);
-  EXPECT_NEAR(tick1.motor_goal_positions.at("2"), 1.0, 1e-9);
-  EXPECT_NEAR(tick1.motor_goal_positions.at("4"), 1.4, 1e-9);
+  EXPECT_NEAR(tick1.motor_goal_positions.at("22"), 0.2, 1e-9);
+  EXPECT_NEAR(tick1.motor_goal_positions.at("0"), -1.0, 1e-9);
+  EXPECT_NEAR(tick1.motor_goal_positions.at("2"), 0.4, 1e-9);
+  EXPECT_NEAR(tick1.motor_goal_positions.at("4"), 0.9, 1e-9);
 
-  // 팔이 아직 ready 자세에 도달하지 않았으면(속도 남아있음) 계속 대기.
-  fsm->set_motor_position("0", -1.8);
-  fsm->set_motor_velocity("0", 50.0);
-  const FsmAction still_moving = fsm->solve_tick();
-  EXPECT_EQ(still_moving.state_string, "PICK.PICK_READY");
-
-  // 팔(+ torso도 아직 안 건드렸으므로 home_q_full 프리셋과 동일한 위치)이 전부
-  // settle됐다고 피드백해도, 비전이 아직 없으면 조용히 대기(publish 없음).
-  fsm->set_motor_position("22", 0.0);
-  fsm->set_motor_velocity("22", 0.0);
-  fsm->set_motor_position("0", -2.3);
-  fsm->set_motor_velocity("0", 0.0);
-  fsm->set_motor_position("2", 1.0);
-  fsm->set_motor_velocity("2", 0.0);
-  fsm->set_motor_position("4", 1.4);
-  fsm->set_motor_velocity("4", 0.0);
+  // 이미 그 자리에 정지해 있으므로 settle 체크가 바로 통과해서, 비전이 아직
+  // 없으면(publish 없이) 곧장 비전 대기로 넘어감 - 추가 이동 없이 즉시 통과되는지
+  // 확인.
   const FsmAction waiting_for_vision = fsm->solve_tick();
   EXPECT_FALSE(waiting_for_vision.publish_motor_command);
   EXPECT_EQ(waiting_for_vision.state_string, "PICK.PICK_READY");
 }
 
-TEST(ManipulationFsm, PickReadyBiasesTorsoTowardVisionYOnceArmSettledThenAdvancesOnceTorsoSettled) {
+TEST(ManipulationFsm, PickReadyRetryReusesFirstLatchedPositionAndWaitsForRealSettle) {
+  // 그립 실패로 PICK_READY에 재진입할 때, 그 순간의 실측값(뻗어나가 있던 실패
+  // 자세)을 다시 latch하는 게 아니라 최초 진입 때의 latch를 그대로 재사용해야
+  // 하고, 실제로 그 자리에 도달할 때까지는 비전 캡처를 시작하면 안 됨
+  // (pick_ready_latched_q_ 필드 주석 참고).
   auto fsm = makeFsm();
-  fsm->on_motion_end(true);
-  fsm->solve_tick();  // state_changed: 팔 ready 명령만 나감
-
-  // 팔이 ready 자세에 도달했다고 피드백.
   fsm->set_motor_position("22", 0.0);
   fsm->set_motor_velocity("22", 0.0);
   fsm->set_motor_position("0", -2.3);
@@ -156,6 +155,97 @@ TEST(ManipulationFsm, PickReadyBiasesTorsoTowardVisionYOnceArmSettledThenAdvance
   fsm->set_motor_velocity("2", 0.0);
   fsm->set_motor_position("4", 1.4);
   fsm->set_motor_velocity("4", 0.0);
+  fsm->on_motion_end(true);  // SIT -> PICK_READY (여기서 위 값이 최초 latch)
+  fsm->solve_tick();  // state_changed
+
+  // 비전 target을 일부러 latch된 자세의 FK 지점과 정확히 같게 잡음(x=0.1765,
+  // z=0.0635, y는 vision_y_offset(0.0328)을 상쇄하도록 0.2323 -> 0.1995) - PICK
+  // approach가 사실상 제자리 궤적이 되므로 큰 변위를 실제로 추적시킬 필요 없이
+  // pick_approach_duration_sec(1.0s=50tick)가 끝나자마자 바로 수렴함(이 테스트의
+  // 목적은 PICK IK 자체의 수렴성이 아니라 아래의 latch/retry 로직 검증임). y가
+  // 0.02 이상이라 torso 재명령 분기를 타긴 하지만 양수 쪽은 *0.0이라(코드 주석
+  // 참고) 실질적으로 값이 안 바뀜.
+  for (int i = 0; i < 10; ++i) {
+    fsm->update_vision(0.1765, 0.2323, 0.0635);
+    fsm->solve_tick();
+  }
+  // 10번째 tick에서 비전 캡처+torso_bias_commanded_가 끝나고, 다음 tick에서
+  // stage-2 settle 확인(이미 그 자리라 즉시 통과)까지 거쳐 PICK으로 전이함.
+  ASSERT_EQ(fsm->solve_tick().state_string, "PICK.PICK");
+
+  // pick_approach_trajectory_(duration 1.0 / dt 0.02 = 50tick)가 다 끝나고 IK가
+  // 실제로 tol 안으로 수렴할 때까지 tick을 충분히 돌림 - ik_converged_가 true여야만
+  // checkGripMotorStopped가 그립 정지 판정을 시작함.
+  for (int i = 0; i < 200; ++i) {
+    fsm->solve_tick();
+  }
+
+  // PICK 도중 팔이 최초 latch와는 다른 자세(뻗어나간 자세)로 옮겨갔다가, 그립
+  // 실패로 PICK_READY로 되돌아왔다고 가정(checkGripMotorStopped와 동일한 방식 -
+  // 그립 모터가 한 번 빠르게 움직인 뒤 gripper_closed_rad 근처에서 멈추면 재시도).
+  fsm->set_motor_position("22", 0.9);
+  fsm->set_motor_velocity("22", 0.0);
+  fsm->set_motor_position("0", -1.5);
+  fsm->set_motor_velocity("0", 0.0);
+  fsm->set_motor_position("2", 0.2);
+  fsm->set_motor_velocity("2", 0.0);
+  fsm->set_motor_position("4", 0.5);
+  fsm->set_motor_velocity("4", 0.0);
+  fsm->set_motor_velocity("6", 5.0);  // 그립 모터가 닫히는 중(빠르게 움직임)
+  fsm->on_motor_feedback();
+  fsm->set_motor_position("6", 0.0);  // gripper_closed_rad(0.0) 그대로 - 아무것도 못 집음
+  fsm->set_motor_velocity("6", 0.0);
+  FsmAction retry_action;
+  for (int i = 0; i < 10; ++i) {  // grip_stopped_streak_ticks 기본값(10)
+    retry_action = fsm->on_motor_feedback();
+  }
+  ASSERT_EQ(retry_action.state_string, "PICK.PICK_READY");
+
+  // 재진입 직후(state_changed) 틱: 방금 실측한 뻗은 자세(0.9/-1.5/0.2/0.5)가
+  // 아니라 최초 latch값(0.0/-2.3/1.0/1.4) 그대로 홀드 명령이 나가야 함.
+  const FsmAction retry_hold = fsm->solve_tick();
+  ASSERT_TRUE(retry_hold.publish_motor_command);
+  EXPECT_NEAR(retry_hold.motor_goal_positions.at("22"), 0.0, 1e-9);
+  EXPECT_NEAR(retry_hold.motor_goal_positions.at("0"), -2.3, 1e-9);
+  EXPECT_NEAR(retry_hold.motor_goal_positions.at("2"), 1.0, 1e-9);
+  EXPECT_NEAR(retry_hold.motor_goal_positions.at("4"), 1.4, 1e-9);
+
+  // 아직 실측이 latch값에 도달 전(방금 세팅한 뻗은 자세 그대로)이므로, 비전을
+  // 줘도 settle 게이트에 막혀 캡처가 시작되면 안 됨(publish_motor_command은
+  // 계속 true - 홀드 명령을 계속 재전송하며 대기).
+  fsm->update_vision(0.1765, 0.2323, 0.0635);
+  const FsmAction still_settling = fsm->solve_tick();
+  EXPECT_TRUE(still_settling.publish_motor_command);
+  EXPECT_EQ(still_settling.state_string, "PICK.PICK_READY");
+
+  // 실제로 latch값에 도달했다고 피드백하면 그제서야 비전 캡처가 시작되고,
+  // 10개 표본을 다 채우면 다시 PICK으로 전이함.
+  fsm->set_motor_position("22", 0.0);
+  fsm->set_motor_position("0", -2.3);
+  fsm->set_motor_position("2", 1.0);
+  fsm->set_motor_position("4", 1.4);
+  for (int i = 0; i < 10; ++i) {
+    fsm->update_vision(0.1765, 0.2323, 0.0635);
+    fsm->solve_tick();
+  }
+  const FsmAction entered_pick_again = fsm->solve_tick();
+  EXPECT_EQ(entered_pick_again.state_string, "PICK.PICK");
+}
+
+TEST(ManipulationFsm, PickReadyBiasesTorsoTowardVisionYOnceArmSettledThenAdvancesOnceTorsoSettled) {
+  auto fsm = makeFsm();
+  // SIT 끝난 시점에 팔이 이미 이 자세(정지)에 있다고 가정 - state_changed가 이
+  // 값을 최초 latch로 읽어들이므로, settle 게이트가 바로 통과함.
+  fsm->set_motor_position("22", 0.0);
+  fsm->set_motor_velocity("22", 0.0);
+  fsm->set_motor_position("0", -2.3);
+  fsm->set_motor_velocity("0", 0.0);
+  fsm->set_motor_position("2", 1.0);
+  fsm->set_motor_velocity("2", 0.0);
+  fsm->set_motor_position("4", 1.4);
+  fsm->set_motor_velocity("4", 0.0);
+  fsm->on_motion_end(true);
+  fsm->solve_tick();  // state_changed: 팔 ready 명령만 나감(latch=현재 실측값)
 
   // 팔 settle이 확인된 뒤에야 비전 캡처가 실제로 쓰임 - tryCapturePendingVision이
   // kVisionSampleTarget(10)개를 모아 평균낼 때까지 캡처를 안 끝내므로, 9번은
@@ -187,10 +277,8 @@ TEST(ManipulationFsm, PickReadyBiasesTorsoTowardVisionYOnceArmSettledThenAdvance
 
 TEST(ManipulationFsm, PickReadyDiscardsAllZeroAndSentinelVisionSamplesFromAverage) {
   auto fsm = makeFsm();
-  fsm->on_motion_end(true);
-  fsm->solve_tick();  // state_changed: 팔 ready 명령만 나감
-
-  // 팔이 ready 자세에 도달했다고 피드백.
+  // SIT 끝난 시점에 팔이 이미 이 자세(정지)에 있다고 가정 - state_changed가 이
+  // 값을 최초 latch로 읽어들이므로, settle 게이트가 바로 통과함.
   fsm->set_motor_position("22", 0.0);
   fsm->set_motor_velocity("22", 0.0);
   fsm->set_motor_position("0", -2.3);
@@ -199,6 +287,8 @@ TEST(ManipulationFsm, PickReadyDiscardsAllZeroAndSentinelVisionSamplesFromAverag
   fsm->set_motor_velocity("2", 0.0);
   fsm->set_motor_position("4", 1.4);
   fsm->set_motor_velocity("4", 0.0);
+  fsm->on_motion_end(true);
+  fsm->solve_tick();  // state_changed: 팔 ready 명령만 나감(latch=현재 실측값)
 
   // x/y/z 셋 다 0.0이거나 셋 다 -0.999(센티널)인 표본, 축 하나만 -0.999인 부분
   // 센티널 표본(z만 깊이 실패 등 - 실측에서 확인된 케이스), 그리고 셋 다 magnitude
@@ -233,38 +323,40 @@ TEST(ManipulationFsm, PickReadyDiscardsAllZeroAndSentinelVisionSamplesFromAverag
   EXPECT_NEAR(torso_commanded.motor_goal_positions.at("22"), -1.0, 1e-9);
 }
 
-TEST(ManipulationFsm, CompleteGripReturnsLeftArmHomeThenPlaysMotionOnceSettled) {
-  // motor id -> 기대값. torso("22")는 home_q_full의 값(0.0) 그대로 쓰고, 나머지
-  // 팔 관절은 stepCompleteGripHoming 전용 IkTuning 기본값(complete_grip_*)을 씀 -
-  // home_q_full(PICK_READY용)과는 별개(공을 든 채로 안전하게 들고 있을 자세).
-  const std::map<std::string, double> home_by_id = {
-      {"22", 0.0}, {"0", -2.1981}, {"2", 0.0}, {"4", -1.4}};
+TEST(ManipulationFsm, CompleteGripPullsBackXThenPlaysMotionOnceSettled) {
+  // stepCompleteGripHoming은 더 이상 고정 프리셋으로 스냅하지 않고, 집은 자세(q_)의
+  // FK EE 위치에서 x를 complete_grip_pull_back_x_m(0.1)만큼 뺀 지점으로 IK를 품.
+  // advance()만으로 건너뛰면 q_가 생성자 기본값(Zero(nq) - 팔이 쭉 펴진 채 특이점에
+  // 가까운 비현실적 자세)에 머물러서, active_joint_weight_scale_=0.0(정규화 없음)과
+  // 겹쳐 damping이 상한까지 튀어 다시는 못 내려오는 채로 영영 안 수렴하는 인공적인
+  // 교착이 생김 - 실제로는 이 상태에 PICK이 IK로 수렴해둔(즉 특이점과 거리가 있는)
+  // 자세로 진입하므로, 테스트도 PICK_READY의 모터 피드백을 home_q_full과 동일한
+  // 값으로 줘서 q_를 그 현실적인 자세로 채워둔 뒤 진입시킴.
+  const std::vector<std::string> kIkMotorIds = {"0", "2", "4", "22"};
 
   auto fsm = makeFsm();
-  ASSERT_TRUE(fsm->advance());  // SIT -> PICK_READY
+  fsm->set_motor_position("22", 0.0);
+  fsm->set_motor_position("0", -2.3);
+  fsm->set_motor_position("2", 1.0);
+  fsm->set_motor_position("4", 1.4);
+  fsm->on_motion_end(true);  // SIT -> PICK_READY
+  fsm->solve_tick();  // state_changed: 위 실측값을 그대로 q_로 읽어들임
   ASSERT_TRUE(fsm->advance());  // PICK_READY -> PICK
   ASSERT_TRUE(fsm->advance());  // PICK -> COMPLETE_GRIP
 
-  // 첫 tick: 왼팔 홈 복귀 명령만 나가고, 아직 모터 피드백이 없어 settle 전이라
-  // 모션은 아직 재생 안 함.
-  const FsmAction first = fsm->solve_tick();
-  ASSERT_TRUE(first.publish_motor_command);
-  EXPECT_FALSE(first.play_motion_number.has_value());
-  for (const auto& [id, home_value] : home_by_id) {
-    EXPECT_NEAR(first.motor_goal_positions.at(id), home_value, 1e-9);
+  // 모터 피드백을 전혀 안 주는 동안은 isSettled가 항상 false라 모션이 재생될 수
+  // 없음 - 그동안 IK가 매 tick 계속 수렴을 시도함.
+  FsmAction last_action;
+  for (int i = 0; i < 200; ++i) {
+    last_action = fsm->solve_tick();
+    EXPECT_FALSE(last_action.play_motion_number.has_value());
   }
+  ASSERT_TRUE(last_action.publish_motor_command);
 
-  // 아직 모터가 안 도달했다고 보고하면(속도 남아있음) 계속 대기.
-  for (const auto& [id, home_value] : home_by_id) {
-    fsm->set_motor_position(id, home_value + 0.5);
-    fsm->set_motor_velocity(id, 50.0);
-  }
-  const FsmAction still_moving = fsm->solve_tick();
-  EXPECT_FALSE(still_moving.play_motion_number.has_value());
-
-  // 전부 도달(home 값 근처 + 속도 0)했다고 보고하면 그제서야 모션(74) 재생.
-  for (const auto& [id, home_value] : home_by_id) {
-    fsm->set_motor_position(id, home_value);
+  // IK가 수렴한 목표(torso+왼팔) 그대로 피드백을 주면 그제서야 settle로 보고
+  // 모션(74)을 재생함.
+  for (const std::string& id : kIkMotorIds) {
+    fsm->set_motor_position(id, last_action.motor_goal_positions.at(id));
     fsm->set_motor_velocity(id, 0.0);
   }
   const FsmAction settled = fsm->solve_tick();
@@ -324,6 +416,18 @@ TEST(ManipulationFsm, VirtualPlaceEntersReachableIkImmediatelyWithoutRotationPha
   ASSERT_EQ(fsm->phase(), Phase::PLACE);
   ASSERT_EQ(fsm->place_state(), PlaceState::VIRTUAL_PLACE);
 
+  // advance()로 건너뛰어서 q_는 생성자 기본값(Zero(nq))에 머물러 있음 - place_trajectory_
+  // 추적을 시작하기 전에 그 자리에 실제로 도달했는지 확인하는 게이트가 있으므로,
+  // 이미 그 값(0.0)에 정지해 있다고 실측 피드백을 미리 줘서 게이트가 바로 통과되게 함.
+  fsm->set_motor_position("22", 0.0);
+  fsm->set_motor_velocity("22", 0.0);
+  fsm->set_motor_position("0", 0.0);
+  fsm->set_motor_velocity("0", 0.0);
+  fsm->set_motor_position("2", 0.0);
+  fsm->set_motor_velocity("2", 0.0);
+  fsm->set_motor_position("4", 0.0);
+  fsm->set_motor_velocity("4", 0.0);
+
   // 회전 준비 단계 없이, 비전을 주면 바로 도달 가능 IK(hard/soft 충돌 회피 포함)가
   // 도는 solve_tick 결과가 나와야 함 - 허리를 별도로 1.5로 고정하는 로직이 없으므로
   // torso 목표가 1.5로 강제되지 않음(PICK_READY와의 핵심 차이). tryCapturePendingVision이
@@ -373,6 +477,19 @@ TEST(ManipulationFsm, CompletePlaceHomingReversesTrajectoryThenPlaysMotion76Befo
   const FsmAction after_place_entry_motion = fsm->on_motion_end(true);  // DONE -> PLACE.VIRTUAL_PLACE
   ASSERT_EQ(after_place_entry_motion.state_string, "PLACE.VIRTUAL_PLACE");
 
+  // advance()로 건너뛰어서 q_는 생성자 기본값(Zero(nq))에 머물러 있음 - VIRTUAL_PLACE/
+  // COMPLETE_PLACE 둘 다 궤적 추적을 시작하기 전에 그 자리에 실제로 도달했는지
+  // 확인하는 게이트가 있으므로, 이미 그 값(0.0)에 정지해 있다고 실측 피드백을
+  // 미리 줘서 게이트가 바로 통과되게 함.
+  fsm->set_motor_position("22", 0.0);
+  fsm->set_motor_velocity("22", 0.0);
+  fsm->set_motor_position("0", 0.0);
+  fsm->set_motor_velocity("0", 0.0);
+  fsm->set_motor_position("2", 0.0);
+  fsm->set_motor_velocity("2", 0.0);
+  fsm->set_motor_position("4", 0.0);
+  fsm->set_motor_velocity("4", 0.0);
+
   // COMPLETE_PLACE가 거꾸로 재생할 place_trajectory_가 실제로 있어야 하므로, 먼저
   // 비전을 캡처시켜 VIRTUAL_PLACE가 진짜 궤적을 만들게 함
   // (VirtualPlaceEntersReachableIkImmediatelyWithoutRotationPhase와 동일 패턴).
@@ -385,28 +502,29 @@ TEST(ManipulationFsm, CompletePlaceHomingReversesTrajectoryThenPlaysMotion76Befo
   ASSERT_EQ(fsm->place_state(), PlaceState::COMPLETE_PLACE);
 
   // place_traj_duration_sec(3.0)/place_traj_dt_sec(0.02) ~= 150tick에 걸쳐
-  // place_traj_time_이 거꾸로 0까지 흘러가야 함 - 그동안은 모터 피드백을 하나도
-  // 안 줬으니 isSettled가 전부 false라 모션(76)이 재생될 수 없음. 마지막 tick의
-  // motor_goal_positions가 역재생 IK의 최종 수렴 목표(torso+왼팔)임.
-  FsmAction last_action;
-  for (int i = 0; i < 200; ++i) {
-    last_action = fsm->solve_tick();
-    EXPECT_FALSE(last_action.play_motion_number.has_value());
-    EXPECT_FALSE(last_action.deactivate_and_notify);
-  }
-  ASSERT_TRUE(last_action.publish_motor_command);
-
-  // 역재생 IK가 수렴한 목표(torso+왼팔) 그대로 피드백을 주면 그제서야 settle로
-  // 보고 모션(76)을 재생함.
+  // place_traj_time_이 거꾸로 0까지 흘러가야 함. COMPLETE_PLACE도 VIRTUAL_PLACE와
+  // 동일하게 매 스텝 실제 도달을 확인한 뒤에야 다음 t로 넘어가는 게이트가 있으므로,
+  // 매 tick 방금 명령한 목표를 그대로(즉시 도달했다고) 피드백해줘서 게이트가 매번
+  // 통과되게 함(실제 하드웨어 동역학은 이 테스트의 관심사가 아님) - 이 루프
+  // 자체가 매 tick 실제로 "도달"까지 시뮬레이션하므로, 역재생이 끝나 모션(76)
+  // 재생이 요청되는 순간까지 자연스럽게 도달함.
   const std::vector<std::string> kIkMotorIds = {"0", "2", "4", "22"};
-  for (const std::string& id : kIkMotorIds) {
-    fsm->set_motor_position(id, last_action.motor_goal_positions.at(id));
-    fsm->set_motor_velocity(id, 0.0);
+  FsmAction action;
+  bool motion_requested = false;
+  for (int i = 0; i < 300 && !motion_requested; ++i) {
+    action = fsm->solve_tick();
+    motion_requested = action.play_motion_number.has_value();
+    EXPECT_FALSE(action.deactivate_and_notify);
+    if (action.publish_motor_command) {
+      for (const std::string& id : kIkMotorIds) {
+        fsm->set_motor_position(id, action.motor_goal_positions.at(id));
+        fsm->set_motor_velocity(id, 0.0);
+      }
+    }
   }
-  const FsmAction settled = fsm->solve_tick();
-  ASSERT_TRUE(settled.play_motion_number.has_value());
-  EXPECT_EQ(*settled.play_motion_number, 76);
-  EXPECT_FALSE(settled.deactivate_and_notify);
+  ASSERT_TRUE(motion_requested);
+  EXPECT_EQ(*action.play_motion_number, 76);
+  EXPECT_FALSE(action.deactivate_and_notify);
 
   // settled인 채로 tick이 계속 돌아도(모션이 아직 안 끝났으므로) 모션을 또
   // 재생 요청하면 안 됨(CompleteGripReturnsLeftArmHomeThenPlaysMotionOnceSettled와 동일 패턴).

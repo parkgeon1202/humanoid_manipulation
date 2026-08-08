@@ -77,7 +77,7 @@ struct IkTuning
   // 채우고 나머지를 중립값으로 채우는 패딩을 담당 - debug_ik_node.cpp와 동일 패턴).
   Eigen::VectorXd joint_weights;
   // PLACE(VIRTUAL_PLACE) 전용 joint_weights - PICK과 반대로 torso_yaw를 더 아끼고
-  // (허리를 덜 쓰고) 팔 위주로 풀게 하려는 용도. stepReachableIk는 phase에 맞는
+  // (허리를 덜 쓰고) 팔 위주로 풀게 하려는 용도. stepPickIk/stepPlaceIk는 phase에 맞는
   // 쪽을 state_changed 시점에 active_joint_weights_로 스냅샷해서 씀(solveTickImpl 참고).
   Eigen::VectorXd place_joint_weights;
   // COMPLETE_PLACE(역재생 홈잉) 전용 joint_weights - stepCompletePlaceHoming
@@ -98,30 +98,33 @@ struct IkTuning
   // 킥과 함께 팔꿈치도 이 각도(rad)만큼 굽혀서 리셋함.
   double elbow_kick_rad = 0.0;
   // torso_yaw 킥 크기(rad). 정체 시 목표와 현재 EE의 y 오차 부호를 보고 현재
-  // torso_yaw에서 이 값만큼 +/- 방향으로 돌림(stepReachableIk 참고).
+  // torso_yaw에서 이 값만큼 +/- 방향으로 돌림(stepPlaceIk 참고).
   double torso_kick_step_rad = 0.5;
   // 위와 동일한 이유로 어깨 pitch도 0.0 대신 이 각도(rad)로 리셋함.
   double left_shoulder_pitch_kick_rad = -2.7;
 
   Eigen::VectorXd home_q_full;  // model.nq(8) 크기, PICK_READY 진입 시 복귀할 자세
 
-  // COMPLETE_GRIP 진입 직후(stepCompleteGripHoming) 왼팔을 복귀시킬 자세(rad) -
-  // home_q_full(PICK_READY 전용)과 별개로, 공을 든 채로 안전하게 들고 있을 자세.
-  double complete_grip_left_shoulder_pitch_rad = -2.1981;  // -1.5rad에서 40도 더 굽힘
-  double complete_grip_left_shoulder_roll_rad = 0.0;
-  double complete_grip_elbow_rad = -1.4;
+  // COMPLETE_GRIP 진입 직후(stepCompleteGripHoming) 고정 프리셋 관절각으로 스냅하는
+  // 대신, 방금 집은 자세의 EE 위치(FK)에서 z를 이만큼(m) 들어올린 지점을 새 IK
+  // 목표로 풀어서 자세를 잡음.
+  double complete_grip_lift_z_m = 0.1;
 
   double gripper_open_rad = 0.0;
   double gripper_closed_rad = 0.0;
-  // VIRTUAL_PLACE에서 물건을 놓을 때 벌리는 목표(stepReachableIk 참고) - PICK_READY
+  // VIRTUAL_PLACE에서 물건을 놓을 때 벌리는 목표(stepPlaceIk 참고) - PICK_READY
   // 진입 시 미리 벌려두는 gripper_open_rad와 별개 값. 그냥 집을 때보다 확실히
   // 떨어뜨리려면 더 크게 벌려야 할 수 있어서 따로 뺌.
   double place_gripper_open_rad = 0.0;
   // VIRTUAL_PLACE에서 그리퍼를 벌릴 때 left_shoulder_pitch도 그 순간 실측값 기준으로
-  // 이만큼(rad) 같이 돌림(stepReachableIk 참고) - 그리퍼 모터와 연결된 프레임이
+  // 이만큼(rad) 같이 돌림(stepPlaceIk 참고) - 그리퍼 모터와 연결된 프레임이
   // 놓는 자세에서 그리퍼 아래쪽으로 가버려서 모터만 돌아가고 실제로는 안 놓아지는
   // 문제 대응(어깨를 더 돌려서 프레임 위치를 바꿔줌).
   double place_release_shoulder_pitch_offset_rad = 0.0;
+  // 위와 동일 시점(그리퍼 벌릴 때 한 번)에 elbow_pitch도 그 순간 실측값 기준으로
+  // 이만큼(rad) 같이 돌림 - shoulder_pitch만으로 부족할 때 팔꿈치까지 보태서
+  // 프레임을 확실히 그리퍼 아래쪽에서 빼냄.
+  double place_release_elbow_offset_rad = 0.0;
 
   // 정체 킥 때 어깨 롤을 이 각도로 리셋함(elbow_kick_rad/left_shoulder_pitch_kick_rad와
   // 짝, kick 전용).
@@ -159,11 +162,19 @@ struct IkTuning
   double place_apex_y = 0.3;
   double place_traj_duration_sec = 3.0;  // 시작->정점->목표 전체 소요 시간(초)
 
-  // VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, stepReachableIk 참고) - 늘고 주는 방향을
-  // 따로 둠. 못 수렴할 때는 빨리 풀어주고(기본 6mm), 수렴할 때는 더 조심스럽게
-  // 조여가려고(기본 3mm) 늘리는 쪽을 더 크게 잡음.
-  double place_tol_increase_step_m = 0.006;
-  double place_tol_decrease_step_m = 0.003;
+  // VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, runDampedIkTick/stepPlaceIk 참고) - 예전엔
+  // 늘고 주는 방향을 비대칭(늘리는 쪽을 더 크게)으로 뒀었는데, 그건 "그냥 result.converged
+  // 여부"로 스트릭을 셀 때(place_tol_이 커서 생긴 가짜 수렴까지 성공으로 잡히던 문제)의
+  // 임시방편이었음. 지금은 rho/damping으로 "진짜 스텝을 밟았는지"부터 걸러내므로 비대칭을
+  // 유지할 근거가 없어져서 같은 값으로 맞춤.
+  double place_tol_increase_step_m = 0.01;
+  double place_tol_decrease_step_m = 0.01;
+  // 그리퍼를 열기 전 마지막 안전판(stepPlaceIk 참고) - allSettled()는 실측 모터가
+  // q_에 도달했는지(joint space)만 보고 q_ 자체가 target_pos_ 근처인지(Cartesian)는
+  // 안 보므로, 실측 관절값으로 다시 FK를 잡아 target_pos_와의 거리가 이 값을 넘으면
+  // 그리퍼를 열지 않고 ik_converged_를 다시 false로 풀어서 재수렴을 시킴. place_tol_의
+  // 상한(kPlaceTolMaxM, 10cm)보다 훨씬 타이트하게 잡아야 의미가 있음.
+  double place_release_max_error_m = 0.02;
 
   // 비전 y값의 실측 오프셋(m) - PICK_READY의 torso_yaw 편향 방향 결정 시
   // target_pos_.y()에서 이 값을 뺀 보정값(corrected_y)을 씀(stepPickReady 참고).
@@ -346,13 +357,22 @@ private:
   // solve_tick()이 위임하는 phase/state별 처리. state_changed는 "지난 solve_tick()
   // 호출 이후로 phase/pick_state/place_state가 바뀌었는지"(자체 감지, 별도 신호 불필요).
   void stepPickReady(bool state_changed);
-  // opening_gripper: 수렴 후 그리퍼를 열고 advance()할지(VIRTUAL_PLACE만 true).
-  // use_place_tol: place_tol_(유동)을 쓸지 - place_trajectory_를 쫓는 VIRTUAL_PLACE
-  // 진행/COMPLETE_PLACE 역재생 둘 다 true, pick_approach_trajectory_를 쫓는 PICK만
-  // false(ik_tuning_.tol 고정). opening_gripper와 별개 축이라 따로 뺌 - COMPLETE_PLACE는
-  // place_trajectory_를 되짚어가면서도 그리퍼는 안 건드려야 해서 opening_gripper=false,
-  // use_place_tol=true 조합이 필요함.
-  void stepReachableIk(bool opening_gripper, bool use_place_tol = false);
+  // PICK(공 접근)/COMPLETE_GRIP(들어올린 자세로 복귀) 전용 - 둘 다 tol은
+  // ik_tuning_.tol 고정, 그리퍼는 항상 닫힌 채로 유지함. 예전엔 이 둘과 아래
+  // stepPlaceIk를 stepReachableIk(bool, bool) 하나로 겸용했는데, place_tol_
+  // 조정/그리퍼 오픈 로직이 붙으면서 두 불리언 조합별로 갈라지는 분기가 너무
+  // 읽기 어려워져서 용도별로 나눔 - 공통 IK 스텝 실행부만 runDampedIkTick()으로 공유.
+  void stepPickIk();
+  // VIRTUAL_PLACE(place_trajectory_ 순방향 추적, opening_gripper=true - 도착하면
+  // 그리퍼를 열고 advance())/COMPLETE_PLACE(같은 궤적을 역재생, opening_gripper=false -
+  // 그리퍼는 안 건드림) 공용 - 둘 다 유동 place_tol_을 씀.
+  void stepPlaceIk(bool opening_gripper);
+  // stepPickIk/stepPlaceIk가 공유하는 저수준 IK 스텝 실행부 - kick_settling_ 대기,
+  // ikStep 호출 + stuck_streak_/kick 트리거까지 처리하고 q_/damping_/ik_converged_까지
+  // 갱신함(converged면 ik_converged_=true). kick_settling_ 대기 중이라 이번 tick엔
+  // ikStep 자체를 안 돌렸으면 std::nullopt를 돌려줌 - 호출부(stepPlaceIk의 place_tol_
+  // 조정 등)가 "이번 tick에 실제로 판단할 근거가 있었는지"를 구분해야 해서.
+  std::optional<ik::IkStepResult> runDampedIkTick(double tol);
   void stepCompleteGripHoming(bool state_changed);
   void stepDoneHoming(bool state_changed);
   void stepCompletePlaceHoming(bool state_changed);
@@ -392,10 +412,10 @@ private:
   IkTuning ik_tuning_;
 
   Eigen::VectorXd q_;
-  // stepReachableIk가 실제로 쓰는 joint_weights - PICK/PLACE 진입(state_changed)
+  // stepPickIk/stepPlaceIk가 실제로 쓰는 joint_weights - PICK/PLACE 진입(state_changed)
   // 시점에 ik_tuning_.joint_weights/place_joint_weights 중 해당하는 걸로 덮어씀.
   Eigen::VectorXd active_joint_weights_;
-  // stepReachableIk가 실제로 쓰는 joint_weight_scale - PICK/VIRTUAL_PLACE 진입 시
+  // stepPickIk/stepPlaceIk가 실제로 쓰는 joint_weight_scale - PICK/VIRTUAL_PLACE 진입 시
   // ik_tuning_.joint_weight_scale로 세팅되지만, COMPLETE_PLACE 역재생(stepCompletePlaceHoming)
   // 진입 시엔 0.0으로 덮어씀(그냥 되돌아가는 구간이라 조인트 사용량을 아낄 필요가
   // 없어서 - active_joint_weights_와 동일 패턴).
@@ -423,15 +443,24 @@ private:
   // true로 세팅 - 그 뒤로는 torso가 그 값에 실제로 도달했는지만 확인함.
   bool torso_bias_commanded_ = false;
 
+  // stepPickReady 전용: PICK_READY에 최초로(SIT 직후) 진입한 그 순간의 실측
+  // 자세를 딱 한 번 latch해두고, 그립 실패로 PICK_READY에 재진입할 때도 매번
+  // 이 값을 그대로 재사용함 - 안 그러면(매번 그 순간 motor_position()을 다시
+  // 읽으면) 그립 실패 직전 팔이 뻗어나가 있던 자세가 그대로 "홀드할 위치"가
+  // 돼버려서 원래의 ready 자세로 다시는 안 돌아옴(onActivatedImpl에서 SIT 진입
+  // 시에만 리셋 - 매 pick 사이클마다 새로 latch).
+  bool pick_ready_q_latched_ = false;
+  Eigen::Vector4d pick_ready_latched_q_ = Eigen::Vector4d::Zero();
+
   // PICK 전용: stepPickReady가 PICK_READY -> PICK 전이 직전(advance() 호출 바로
   // 앞)에 시작(EE)->target_pos_ 2점으로 한 번 만들어두고, PICK 상태(solveTickImpl)가
   // 매 틱 이 궤적의 result(pick_approach_traj_time_)를 target_pos_로 갱신해서
-  // stepReachableIk에 흘려보냄(place_trajectory_와 동일 패턴, IkTuning::pick_approach_duration_sec 참고).
+  // stepPickIk에 흘려보냄(place_trajectory_와 동일 패턴, IkTuning::pick_approach_duration_sec 참고).
   ik::TrajectoryGenerator pick_approach_trajectory_;
   double pick_approach_traj_time_ = 0.0;
 
   // VIRTUAL_PLACE 전용: target_pos_를 매 틱 이 궤적의 result(place_traj_time_)로 갱신해서
-  // 기존 ikStep 루프에 그대로 흘려보냄(경유점은 stepReachableIk 진입 전에 구성).
+  // 기존 ikStep 루프에 그대로 흘려보냄(경유점은 stepPickIk/stepPlaceIk 진입 전에 구성).
   // COMPLETE_PLACE(stepCompletePlaceHoming)가 같은 place_trajectory_를 place_traj_time_을
   // duration에서 0으로 거꾸로 흘려보내며 재사용 - 놓으러 갈 때 지나간 장애물 회피
   // 아크를 그대로 되짚어 돌아오게 함(clear()는 다음 VIRTUAL_PLACE 재진입 때만 호출됨).
@@ -439,18 +468,20 @@ private:
   double place_traj_time_ = 0.0;
   bool ik_converged_ = false;
   int stuck_streak_ = 0;
-  // VIRTUAL_PLACE 전용(stepReachableIk 참고) - ik_tuning_.tol을 그대로 안 쓰고
+  // VIRTUAL_PLACE 전용(stepPlaceIk 참고) - ik_tuning_.tol을 그대로 안 쓰고
   // 이 값을 params.tol로 씀(PICK은 ik_tuning_.tol 그대로). kPlaceTolInitialM(3mm)로
   // 시작해서, 연속 10번 수렴하면 kPlaceTolStepM(3mm)씩 조이되(하한 ik_tuning_.tol),
   // 연속 10번 미수렴하면 3mm씩 풀어줌(상한 없음).
   double place_tol_ = 0.0;  // 0.0이면 "아직 초기화 안 됨" - state_changed에서 세팅.
   int place_tol_success_streak_ = 0;
   int place_tol_fail_streak_ = 0;
-  // VIRTUAL_PLACE 놓기 전용(stepReachableIk 참고) - 그리퍼를 벌리기 시작하는 순간
+  // VIRTUAL_PLACE 놓기 전용(stepPlaceIk 참고) - 그리퍼를 벌리기 시작하는 순간
   // 딱 한 번만 그 시점 실측 left_shoulder_pitch + offset을 q_[kLeftArmIndices[0]]에
   // 바로 대입해서 고정해둠(매 tick 다시 읽으면 목표 자체가 계속 움직여서 isSettled가
   // 영영 안 됨) - 목표값 자체는 q_ 안에 있으므로 별도 필드로 안 둠.
   bool place_release_shoulder_pitch_commanded_ = false;
+  // 위와 동일 이유(elbow_pitch 버전) - place_release_elbow_offset_rad 필드 주석 참고.
+  bool place_release_elbow_commanded_ = false;
   bool kick_settling_ = false;
   double gripper_position_ = 0.0;
 
