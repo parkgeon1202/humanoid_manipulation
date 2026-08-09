@@ -1,6 +1,7 @@
 #include "fsm.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -377,7 +378,9 @@ FsmAction ManipulationFSM::finalize()
 
 // 특정 모터가 목표 위치에 도달하고 속도가 충분히 낮은지 판단. motor_positions_/
 // motor_velocities_는 motor_status 콜백 스레드가 쓰므로 data_mutex_로 짧게 보호.
-bool ManipulationFSM::isSettled(const std::string & motor_id, double target_rad) const
+bool ManipulationFSM::isSettled(const std::string & motor_id, double target_rad,
+                                 std::optional<double> velocity_threshold_override,
+                                 std::optional<double> position_tolerance_override) const
 {
   // 모션 재생 중엔 외부 모션 재생기가 모터를 직접 구동해서 우리가 세팅해둔
   // target_rad가 더 이상 의미가 없음 - 무조건 미도달로 취급.
@@ -397,17 +400,25 @@ bool ManipulationFSM::isSettled(const std::string & motor_id, double target_rad)
     position = pos_it->second;
     velocity = vel_it->second;
   }
-  return std::fabs(velocity) < ik_tuning_.settle_velocity_threshold &&
-         std::fabs(position - target_rad) < ik_tuning_.settle_position_tolerance_rad;
+  const double velocity_threshold =
+    velocity_threshold_override.value_or(ik_tuning_.settle_velocity_threshold);
+  const double position_tolerance_rad =
+    position_tolerance_override.value_or(ik_tuning_.settle_position_tolerance_rad);
+  return std::fabs(velocity) < velocity_threshold &&
+         std::fabs(position - target_rad) < position_tolerance_rad;
 }
 
 
 // 여러 모터가 각자의 목표 위치에 전부 도달했는지 판단(isSettled를 목록에 대해 AND).
 // 허리+어깨 회전 settle, COMPLETE_PLACE 홈잉 settle이 전부 이 하나로 통일됨.
-bool ManipulationFSM::allSettled(const std::vector<std::pair<std::string, double>> & targets) const
+bool ManipulationFSM::allSettled(const std::vector<std::pair<std::string, double>> & targets,
+                                  std::optional<double> velocity_threshold_override,
+                                  std::optional<double> position_tolerance_override) const
 {
   for (const auto & [motor_id, target_rad] : targets) {
-    if (!isSettled(motor_id, target_rad)) {
+    if (!isSettled(motor_id, target_rad, velocity_threshold_override,
+        position_tolerance_override))
+    {
       return false;
     }
   }
@@ -706,6 +717,7 @@ void ManipulationFSM::solveTickImpl()
       place_tol_fail_streak_ = 0;
       place_release_shoulder_pitch_commanded_ = false;
       place_release_elbow_commanded_ = false;
+      place_release_error_confirmed_ok_ = false;
       kick_settling_ = false;
       ik_converged_ = false;
       has_captured_target_ = false;
@@ -787,7 +799,7 @@ void ManipulationFSM::solveTickImpl()
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
 
       place_trajectory_.put_point(
-        duration, target_pos_.x()-0.05, target_pos_.y(),
+        duration, target_pos_.x()-0.05, target_pos_.y()+0.05,
         start_pos.z() + vz * duration + 0.05,
         /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
       
@@ -879,12 +891,16 @@ void ManipulationFSM::stepCompleteGripHoming(bool state_changed)
     return;
   }
 
+  // 실측으로 이 대기가 15~20초까지 걸리는 걸 확인해서(대화 참고), 다른 settle
+  // 판정(허리/어깨 회전 대기 등)엔 영향 없이 이 구간만 더 느슨한 임계값
+  // (ik_tuning_.complete_grip_settle_*)을 override로 넘김.
   const bool settled = allSettled({
       {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
       {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
       {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
       {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
-    });
+    }, ik_tuning_.complete_grip_settle_velocity_threshold,
+    ik_tuning_.complete_grip_settle_position_tolerance_rad);
 
   std::optional<int32_t> motion;
   if (settled) {
@@ -932,28 +948,38 @@ void ManipulationFSM::stepDoneHoming(bool state_changed)
 void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
 {
   if (state_changed) {
-    // VIRTUAL_PLACE는 그리퍼가 열릴 때까지 기다리는 동안에도 place_traj_time_을
-    // duration 너머로 계속 흘려보내므로(그 tick들도 매번 += dt_sec), 역재생
-    // 시작점을 duration으로 다시 고정하고 IK를 강제로 다시 풀게 함 - place_trajectory_
-    // 자체는 아직 clear() 안 됐으므로(다음 VIRTUAL_PLACE 진입 때만 지워짐) 그대로 재사용.
-    place_traj_time_ = ik_tuning_.place_traj_duration_sec;
-    ik_converged_ = false;
-    damping_ = ik_tuning_.default_damping;
-    stuck_streak_ = 0;
-    // VIRTUAL_PLACE 갈 때 풀려있던 값을 그대로 이어받지 않고 COMPLETE_PLACE도 항상
-    // kPlaceTolInitialM(3mm)부터 다시 시작 - place_tol_은 상한(kPlaceTolMaxM)까지는
-    // 있어도 하한 없이 갈 때 계속 커질 수 있어서, 그 느슨해진 값 그대로 물려받으면
-    // 실제로는 안 쫓아가면서 "수렴함"으로 착각하는 구간이 생김(t=0에서 갑자기 크게
-    // 튀는 문제의 원인 - fsm.cpp 관련 대화 참고).
-    place_tol_ = kPlaceTolInitialM;
-    place_tol_success_streak_ = 0;
-    place_tol_fail_streak_ = 0;
-    kick_settling_ = false;
-    // 되짚어 돌아가는 구간도 torso_yaw는 아껴 쓰게(complete_place_joint_weights,
-    // 기본 [100,1,1,1]) 함 - 그러려면 joint_weight_scale 정규화가 꺼져있으면(0.0)
-    // 가중치 자체가 무의미해지므로 여기선 켬(ik_tuning_.joint_weight_scale).
-    active_joint_weights_ = ik_tuning_.complete_place_joint_weights;
-    active_joint_weight_scale_ = ik_tuning_.joint_weight_scale;
+    // [실험] place_trajectory_를 IK로 되짚어가는 대신, q_를 두 지점에 순서대로 직접
+    // 스냅하고 각각 실측 settle만 확인함(대화 참고) - 1단계: ready pose
+    // (ik_tuning_.home_q_full, yaml의 pick_ready_home_q). 2단계(아래 본문)는 완전
+    // 홈(0). 기존 IK 역재생 초기화/루프는 그대로 두되 전부 주석 처리해서 언제든
+    // 되돌릴 수 있게 함.
+    q_[ik::kTorsoJointIndex] = ik_tuning_.home_q_full[ik::kTorsoJointIndex];
+    q_[ik::kLeftArmIndices[0]] = ik_tuning_.home_q_full[ik::kLeftArmIndices[0]];
+    // left_shoulder_roll은 home_q_full 값(0.3) 대신 1.0으로 고정(1단계/2단계 둘 다
+    // 동일하게 - 대화 참고).
+    q_[ik::kLeftArmIndices[1]] = 1.0;
+    q_[ik::kLeftArmIndices[2]] = ik_tuning_.home_q_full[ik::kLeftArmIndices[2]];
+    set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
+    set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
+    set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
+    set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
+    complete_place_reached_ready_pose_ = false;
+
+    // 기존 IK 역재생용 초기화(주석 처리 - 대화 참고):
+    // // VIRTUAL_PLACE는 그리퍼가 열릴 때까지 기다리는 동안에도 place_traj_time_을
+    // // duration 너머로 계속 흘려보내므로(그 tick들도 매번 += dt_sec), 역재생
+    // // 시작점을 duration으로 다시 고정하고 IK를 강제로 다시 풀게 함 - place_trajectory_
+    // // 자체는 아직 clear() 안 됐으므로(다음 VIRTUAL_PLACE 진입 때만 지워짐) 그대로 재사용.
+    // place_traj_time_ = ik_tuning_.place_traj_duration_sec;
+    // ik_converged_ = false;
+    // damping_ = ik_tuning_.default_damping;
+    // stuck_streak_ = 0;
+    // place_tol_ = kPlaceTolInitialM;
+    // place_tol_success_streak_ = 0;
+    // place_tol_fail_streak_ = 0;
+    // kick_settling_ = false;
+    // active_joint_weights_ = ik_tuning_.complete_place_joint_weights;
+    // active_joint_weight_scale_ = ik_tuning_.joint_weight_scale;
   }
 
   // 모션(76)이 재생 중이면 SIT/DONE/COMPLETE_GRIP 진입 모션과 동일하게 완전히
@@ -965,56 +991,56 @@ void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
     return;
   }
 
-  // place_traj_time_이 아직 0 위(reverse_in_progress)거나, 0에 도달했어도 마지막
-  // 목표(start_pos)로 IK가 아직 실제로 수렴 안 했으면(!ik_converged_) 계속 추적.to
-  // 게이트를 ik_converged_ 하나로만 걸면(예전 버전의 버그) reverse_in_progress인
-  // 도중 중간 경유점에 스치듯 수렴해 ik_converged_가 잠깐 true가 되는 순간 다음
-  // tick부터 이 블록에 아예 안 들어오게 돼서, 남은 아크(정점 등)를 못 따라가고
-  // 궤적 극초반에서 바로 복귀 단계로 새버림 - place_traj_time_ > 0.0도 같이 걸어서
-  // 시간이 안 끝났으면 ik_converged_ 값과 무관하게 계속 이 블록에 들어오게 함.
-  if (place_traj_time_ > 0.0 || !ik_converged_) {
-    // place_traj_time_을 흘려보내기(거꾸로 감기) 전에, 방금 IK가 계산해둔
-    // q_(직전 tick의 결과)에 관절들이 실제로 도달했는지 먼저 확인함(VIRTUAL_PLACE의
-    // 순방향 루프와 동일한 이유 - 위쪽 주석 참고). 안 그러면 실제 로봇이 못
-    // 따라오는 동안에도 시간이 계속 거꾸로 흘러버려서 소프트웨어 목표가 실제
-    // 팔보다 앞서 나가며 아크를 스치듯 지나쳐버림.
-    if (!allSettled({
+  // 기존 IK 역재생 루프(주석 처리 - 대화 참고):
+  // if (place_traj_time_ > 0.0 || !ik_converged_) {
+  //   if (!allSettled({
+  //       {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
+  //       {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
+  //       {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
+  //       {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
+  //     }))
+  //   {
+  //     makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+  //                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+  //     return;
+  //   }
+  //   const bool reverse_in_progress = place_traj_time_ > 0.0;
+  //   target_pos_ = place_trajectory_.result(place_traj_time_);
+  //   place_traj_time_ = std::max(0.0, place_traj_time_ - ik_tuning_.place_traj_dt_sec);
+  //   if (reverse_in_progress) {
+  //     ik_converged_ = false;
+  //   }
+  //   stepPlaceIk(/*opening_gripper=*/false);
+  //   return;
+  // }
+
+  if (!complete_place_reached_ready_pose_) {
+    // 1단계: q_가 이미 ready pose로 스냅돼있으므로(위 state_changed), 실측이 거기
+    // 도달했는지만 확인. 도달했으면 2단계(완전 홈)로 q_를 다시 스냅하고 한 번만 명령.
+    const bool ready_settled = allSettled({
         {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
         {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
         {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
         {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
-      }))
-    {
-      makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
-                          /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
-      return;
+      });
+    if (ready_settled) {
+      q_ = Eigen::VectorXd::Zero(robot_model_.model().nq);
+      // left_shoulder_roll은 여기서도 0.0 대신 1.0으로 고정(위 1단계와 동일 - 대화 참고).
+      q_[ik::kLeftArmIndices[1]] = 1.0;
+      set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
+      set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
+      set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
+      set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
+      complete_place_reached_ready_pose_ = true;
     }
-
-    // place_trajectory_를 duration -> 0으로 거꾸로 재생 - 놓으러 갈 때 돌던 장애물
-    // 회피 아크를 그대로 되짚어감. VIRTUAL_PLACE의 순방향 루프와 동일한 이유로,
-    // 아직 시작점(t=0)에 안 왔으면 매 tick 다시 풀게 ik_converged_를 계속 false로
-    // 눌러둠(안 그러면 지난 tick에 우연히 tol 안으로 들어온 즉시 굳어버림).
-    const bool reverse_in_progress = place_traj_time_ > 0.0;
-    target_pos_ = place_trajectory_.result(place_traj_time_);
-    place_traj_time_ = std::max(0.0, place_traj_time_ - ik_tuning_.place_traj_dt_sec);
-    if (reverse_in_progress) {
-      ik_converged_ = false;
-    }
-    // opening_gripper=false - stepPlaceIk는 ik_converged_가 false인 동안 opening_gripper를
-    // 안 씀(그 값을 읽는 분기는 전부 else if(ik_converged_) 쪽)이라 그리퍼는 여기서 그대로
-    // 안 건드림. stepPlaceIk를 씀(stepPickIk 아님)은 필수 - place_trajectory_를 그대로
-    // 되짚는 구간이라 VIRTUAL_PLACE가 갈 때 이미 풀어놓은 place_tol_을 이어받아야
-    // 똑같이 막혔던 지점에서 안 얼어붙음.
-    stepPlaceIk(/*opening_gripper=*/false);
+    makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
     return;
   }
 
-  // 역재생 IK가 시작점(= PICK.DONE 재활성화 시점의 EE 위치)까지 다시 수렴함 - 그
-  // 지점(torso+왼팔)에 실제로 settle된 뒤에야(stepCompleteGripHoming과 동일한
-  // command-once + settle-poll 패턴 - q_는 추적 단계에서 이미 매 tick
-  // set_motor_goal_position으로 계속 명령해뒀으므로 여기서 다시 세팅할 필요 없음)
-  // 모션(76)을 재생해서 전신(다리+반대팔 포함)을 최종 자세로 되돌림 - 모션이
-  // 끝나면 onMotionEndImpl이 deactivate함.
+  // 2단계: 완전 홈(0)에 실측이 도달했는지 확인한 뒤에야(stepCompleteGripHoming과
+  // 동일한 command-once + settle-poll 패턴) 모션(76)을 재생해서 전신(다리+반대팔
+  // 포함)을 최종 자세로 되돌림 - 모션이 끝나면 onMotionEndImpl이 deactivate함.
   const bool settled = allSettled({
       {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
       {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
@@ -1244,6 +1270,18 @@ void ManipulationFSM::stepPickIk()
   if (!ik_converged_) {
     const std::optional<ik::IkStepResult> result = runDampedIkTick(ik_tuning_.tol);
     if (result) {
+      // stepPickIk 경로(PICK/COMPLETE_GRIP)는 PLACE의 place_tol_ 같은 유동 완화가
+      // 없고 고정 ik_tuning_.tol만 씀 - "거의 다 왔는데 tol을 못 넘어서 멈춘" 상황을
+      // 눈으로 확인하려고 매 tick(수렴 여부 무관) 찍음. hard_rejected=0인데
+      // damping이 상한 근처에서 안 내려가면 rho가 계속 나빠서(충돌은 아님) 스텝이
+      // 사실상 0에 가까워진 정체 상태라는 뜻 - 이땐 stuck_streak_/kick도 안 걸림
+      // (그건 hard_rejected 전용이라서, 대화 참고).
+      const double error_norm = (target_pos_ - ik::eePosition(robot_model_, q_)).norm();
+      std::printf(
+        "[pick_stall_debug] converged=%d error_norm=%.4f tol=%.4f damping=%.6f "
+        "hard_rejected=%d stuck_streak=%d\n",
+        result->converged ? 1 : 0, error_norm, ik_tuning_.tol, damping_,
+        result->hard_rejected ? 1 : 0, stuck_streak_);
       if (result->converged) {
         const Eigen::Vector3d converged_ee = ik::eePosition(robot_model_, q_);
         std::printf(
@@ -1329,6 +1367,19 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
         place_tol_, result->converged ? 1 : 0, real_step ? 1 : 0, damping_before, damping_,
         place_tol_success_streak_, place_tol_fail_streak_);
 
+      // damping이 상한까지 올라갔다는 건 트러스트 리전이 계속 스텝을 반려해서 더는
+      // 못 나아간다는 뜻(stepPickIk의 pick_stall_debug와 동일 진단, 대화 참고) - 이
+      // 상태로 계속 기다려봐야 더 좁혀지지 않으니 "여기가 한계"로 보고 바로 수렴
+      // 처리해서 opening_gripper 쪽 그리퍼 오픈 시퀀스(place_release_error_confirmed_ok_
+      // 래치도 같이)로 넘어가게 함 - Cartesian 재검사(real_error) 없이 바로 감.
+      if (damping_ >= ik_tuning_.max_damping) {
+        std::printf(
+          "[place_damping_maxed] damping=%.4f >= max=%.4f - treating as converged\n",
+          damping_, ik_tuning_.max_damping);
+        ik_converged_ = true;
+        place_release_error_confirmed_ok_ = true;
+      }
+
       if (result->converged) {
         const Eigen::Vector3d converged_ee = ik::eePosition(robot_model_, q_);
         std::printf(
@@ -1353,13 +1404,16 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
     // 팔(torso+왼팔)이 물리적으로 그 자리에 도달했다는 보장이 아님 - 그 상태에서
     // 바로 그리퍼를 열면 팔이 아직 궤적 끝점으로 이동 중인데 그리퍼부터 벌어지는
     // 문제가 있었음(VIRTUAL_PLACE 전용 - opening_gripper=true인 호출부가 여기뿐).
-    // 그리퍼를 열기 전에 실측 피드백으로 진짜 도달을 먼저 확인함.
+    // 그리퍼를 열기 전에 실측 피드백으로 진짜 도달을 먼저 확인함. 여기도 다른 곳
+    // (advance() 게이트, COMPLETE_GRIP z+lift 대기)과 같은 느슨한 임계값을 재사용함
+    // (complete_grip_settle_* - 대화 참고).
     if (!allSettled({
         {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
         {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
         {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
         {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
-      }))
+      }, ik_tuning_.complete_grip_settle_velocity_threshold,
+      ik_tuning_.complete_grip_settle_position_tolerance_rad))
     {
       // 아직 실측이 IK 목표에 도달 전 - 그리퍼는 계속 닫힌 채(gripper_position_
       // 유지) 조용히 대기.
@@ -1367,28 +1421,39 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       // allSettled는 "실측 모터가 q_에 도달했는가"(joint space)만 볼 뿐, 그 q_ 자체가
       // target_pos_ 근처인지(Cartesian)는 안 봄 - place_tol_이 느슨한 채로 ik_converged_가
       // 됐으면 q_가 target_pos_에서 최대 place_tol_(상한 kPlaceTolMaxM=10cm)만큼 떨어진
-      // 채로 여기 올 수 있음. 실측 관절값으로 다시 FK를 잡아 독립적으로 재확인해서,
-      // 벗어나 있으면 그리퍼를 열지 않고 ik_converged_를 다시 풀어서 재수렴시킴
-      // (place_release_max_error_m 필드 주석 참고).
-      Eigen::VectorXd q_real = q_;
-      q_real[ik::kTorsoJointIndex] = motor_position(kTorsoMotorId);
-      q_real[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId);
-      q_real[ik::kLeftArmIndices[1]] = motor_position(kLeftShoulderRollMotorId);
-      q_real[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId);
-      const double real_error = (target_pos_ - ik::eePosition(robot_model_, q_real)).norm();
-      if (real_error > ik_tuning_.place_release_max_error_m) {
-        std::printf(
-          "[place_release_guard] blocked: real_error=%.4f > max=%.4f - re-solving from real q\n",
-          real_error, ik_tuning_.place_release_max_error_m);
-        // ik_converged_만 풀고 q_는 그대로 두면, q_ 기준으로는 이미 target_pos_에서
-        // place_tol_ 이내(그러니까 애초에 converged=true였던 것)라 다음 tick ikStep이
-        // error_norm을 다시 재보자마자 또 즉시 "수렴함"으로 판정해버려서 q_가 전혀
-        // 안 바뀐 채로 이 분기에 영원히 되돌아옴(실측으로 확인됨 - real_error가 매
-        // tick 똑같은 값으로 안 줄어듦). q_를 실측 위치로 스냅해야 다음 ikStep이
-        // "진짜 지금 어디 있는지" 기준으로 다시 계산해서 실제 보정 스텝을 밟음.
-        q_ = q_real;
-        ik_converged_ = false;
-      } else {
+      // 채로 여기 올 수 있음. place_release_error_confirmed_ok_가 아직 안 래치됐으면
+      // 실측 관절값으로 다시 FK를 잡아 독립적으로 재확인해서, 벗어나 있으면 그리퍼를
+      // 열지 않고 ik_converged_를 다시 풀어서 재수렴시킴(계속 IK는 풀리게 둠).
+      // 한 번이라도 이내로 확인되면 그 뒤로는 재검사 없이 래치 유지 - 아래 그리퍼
+      // 오픈 시퀀스(어깨/팔꿈치 오프셋)가 일부러 EE를 target_pos_에서 떨어뜨리는
+      // 동작이라, 매 tick 재검사하면 오프셋 적용 후 real_error가 다시 max를 넘어서
+      // 이 가드가 q_를 되돌려버리는 충돌이 있었음(대화 참고 - 그리퍼 여는 동안 팔이
+      // 흔들리던 원인. place_release_max_error_m/place_release_error_confirmed_ok_
+      // 필드 주석 참고).
+      if (!place_release_error_confirmed_ok_) {
+        Eigen::VectorXd q_real = q_;
+        q_real[ik::kTorsoJointIndex] = motor_position(kTorsoMotorId);
+        q_real[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId);
+        q_real[ik::kLeftArmIndices[1]] = motor_position(kLeftShoulderRollMotorId);
+        q_real[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId);
+        const double real_error = (target_pos_ - ik::eePosition(robot_model_, q_real)).norm();
+        if (real_error > ik_tuning_.place_release_max_error_m) {
+          std::printf(
+            "[place_release_guard] blocked: real_error=%.4f > max=%.4f - re-solving from real q\n",
+            real_error, ik_tuning_.place_release_max_error_m);
+          // ik_converged_만 풀고 q_는 그대로 두면, q_ 기준으로는 이미 target_pos_에서
+          // place_tol_ 이내(그러니까 애초에 converged=true였던 것)라 다음 tick ikStep이
+          // error_norm을 다시 재보자마자 또 즉시 "수렴함"으로 판정해버려서 q_가 전혀
+          // 안 바뀐 채로 이 분기에 영원히 되돌아옴(실측으로 확인됨 - real_error가 매
+          // tick 똑같은 값으로 안 줄어듦). q_를 실측 위치로 스냅해야 다음 ikStep이
+          // "진짜 지금 어디 있는지" 기준으로 다시 계산해서 실제 보정 스텝을 밟음.
+          q_ = q_real;
+          ik_converged_ = false;
+        }
+        place_release_error_confirmed_ok_ = real_error <= ik_tuning_.place_release_max_error_m;
+      }
+
+      if (place_release_error_confirmed_ok_) {
         // 매 tick 목표를 조금씩(step) 당기지 않고 열림 목표를 한 번에 그대로 명령함 -
         // 실제 이동 속도/궤적은 모터 자체의 profile_velocity가 담당. 완료 판정은
         // 소프트웨어 setpoint가 아니라 실제 모터 피드백(isSettled)으로 함.
@@ -1413,17 +1478,30 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
             ik_tuning_.place_release_elbow_offset_rad;
           place_release_elbow_commanded_ = true;
         }
-        if (isSettled(kGripMotorId, ik_tuning_.place_gripper_open_rad) &&
-          isSettled(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]) &&
-          isSettled(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]))
+        // 여기도 COMPLETE_GRIP z+lift 대기에서 쓰던 것과 같은 느슨한 임계값을 재사용함
+        // (complete_grip_settle_* - 이름은 COMPLETE_GRIP 전용처럼 보이지만 실제로는
+        // "이 두 군데의 settle 대기 전용 느슨한 값"이라는 뜻으로 같이 씀, 대화 참고).
+        if (isSettled(kGripMotorId, ik_tuning_.place_gripper_open_rad,
+            ik_tuning_.complete_grip_settle_velocity_threshold,
+            ik_tuning_.complete_grip_settle_position_tolerance_rad) &&
+          isSettled(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]],
+            ik_tuning_.complete_grip_settle_velocity_threshold,
+            ik_tuning_.complete_grip_settle_position_tolerance_rad) &&
+          isSettled(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]],
+            ik_tuning_.complete_grip_settle_velocity_threshold,
+            ik_tuning_.complete_grip_settle_position_tolerance_rad))
         {
           advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
         }
       }
     }
-  } else {
-    gripper_position_ = ik_tuning_.gripper_closed_rad;
   }
+  // [실험] opening_gripper=false로 stepPlaceIk를 부르는 곳(COMPLETE_PLACE의 옛 IK
+  // 역재생)이 지금 전부 주석 처리돼있어서, 이 else는 지금 도달 불가능한 죽은 코드임
+  // (대화 참고) - 원복하려면 주석을 풀면 됨.
+  // else {
+  //   gripper_position_ = ik_tuning_.gripper_closed_rad;
+  // }
 
   set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
   set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);

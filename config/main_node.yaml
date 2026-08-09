@@ -70,7 +70,7 @@ manipulation_node_cpp:
     place.apex_x: 0.1
     place.apex_y: 0.2
     # 시작->정점->목표 전체 궤적 재생 시간(초).
-    place.traj_duration_sec: 3.0
+    place.traj_duration_sec: 1.0
 
     # VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, runDampedIkTick/stepPlaceIk 참고) - rho/
     # damping으로 "진짜 스텝을 밟았는지"부터 걸러낸 뒤에만 스트릭을 세므로(fsm.hpp
@@ -84,7 +84,7 @@ manipulation_node_cpp:
     # 그리퍼를 열기 전 마지막 Cartesian 안전판(fsm.hpp place_release_max_error_m 필드
     # 주석 참고) - 실측 관절값 기준 EE가 target_pos_에서 이 값보다 멀면 그리퍼를 안
     # 열고 재수렴시킴.
-    place.release_max_error_m: 0.04
+    place.release_max_error_m: 0.1
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.
@@ -93,6 +93,13 @@ manipulation_node_cpp:
     # COMPLETE_GRIP 진입 시 집은 자세의 EE(FK)에서 z를 이만큼(m) 들어올린 지점을
     # 새 IK 목표로 풀어서 안전하게 들고 있는 자세를 잡음.
     pick.complete_grip_lift_z_m: 0.1
+
+    # 위 z+lift 목표로 실측이 도달했다고 볼 settle 임계값(fsm.hpp
+    # complete_grip_settle_*_threshold 필드 주석 참고) - 공용 ik.torso_settle_*
+    # 임계값과 별개로 이 대기 전용. 실측으로 이 구간 settle이 15~20초까지 걸리는 걸
+    # 확인해서(대화 참고) 일부러 더 느슨하게 잡음 - 실기 테스트로 더 튜닝 필요.
+    pick.complete_grip_settle_velocity_threshold: 0.6
+    pick.complete_grip_settle_position_tolerance_rad: 0.6
 
     # joint_weights 앞에 곱해지는 고정 세기. damping과 독립적으로 둠(damping에
     # 얹으면 수렴이 잘 될수록 이 항이 무의미해짐).
@@ -174,8 +181,8 @@ manipulation_node_cpp:
     # VIRTUAL_PLACE에서 그리퍼를 벌릴 때 left_shoulder_pitch도 그 순간 실측값 기준으로
     # 이만큼(도) 같이 돌림 - 그리퍼 모터와 연결된 프레임이 놓는 자세에서 그리퍼
     # 아래쪽으로 가버려서 모터만 돌고 실제로는 안 놓아지는 문제 대응.
-    gripper.place_release_shoulder_pitch_offset_deg: 30.0
+    gripper.place_release_shoulder_pitch_offset_deg: 38.0
     # 위와 같은 시점(그리퍼 벌릴 때 딱 한 번)에 elbow_pitch도 그 순간 실측값 기준으로
     # 이만큼(도) 같이 돌림 - shoulder_pitch만으로 부족할 때 팔꿈치까지 보태서 프레임을
     # 확실히 빼냄.
-    gripper.place_release_elbow_offset_deg: -40.0
+    gripper.place_release_elbow_offset_deg: -20.0

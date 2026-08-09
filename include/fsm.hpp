@@ -138,6 +138,13 @@ struct IkTuning
   double settle_velocity_threshold = 0.3;  // CurrentMotorStatus.velocity는 rad/s 단위
   double settle_position_tolerance_rad = 0.05;
 
+  // COMPLETE_GRIP z+lift 목표 전용(stepCompleteGripHoming 참고) - 위 공용 settle
+  // 임계값(다른 곳의 허리/어깨 회전 대기 등에도 쓰임)을 그대로 쓰면 이 구간만 실측
+  // settle까지 15~20초씩 걸리는 문제가 있어서(대화 참고) 이 대기 전용으로 더 느슨한
+  // 값을 따로 둠 - isSettled/allSettled의 override 인자로 넘겨서 다른 곳엔 영향 없음.
+  double complete_grip_settle_velocity_threshold = 0.6;
+  double complete_grip_settle_position_tolerance_rad = 0.6;
+
   // 그립 모터(6번) 정지 판정(main_node.yaml의 grip.* 그대로).
   double grip_moving_velocity_threshold = 0.5;
   double grip_near_zero_position_threshold = 0.1;
@@ -345,9 +352,17 @@ private:
   bool checkGripMotorStopped(double motor6_velocity);
   // 모터 하나가 목표 위치(rad)에 도달했는지(위치+속도 둘 다 임계값 안) 판정하는
   // 유일한 통로 - 회전 settle/COMPLETE_PLACE 홈잉 settle이 전부 이걸 통해서만 판정함.
-  bool isSettled(const std::string & motor_id, double target_rad) const;
+  // velocity_threshold_override/position_tolerance_override: 생략하면(nullopt)
+  // ik_tuning_.settle_velocity_threshold/settle_position_tolerance_rad를 그대로 씀 -
+  // 특정 대기 구간만 다른 임계값을 쓰고 싶을 때만(예: stepCompleteGripHoming의
+  // complete_grip_settle_*) 채워서 넘김.
+  bool isSettled(const std::string & motor_id, double target_rad,
+                 std::optional<double> velocity_threshold_override = std::nullopt,
+                 std::optional<double> position_tolerance_override = std::nullopt) const;
   // motor_id -> 목표 위치(rad) 목록을 받아서 전부 isSettled()를 만족하는지 확인.
-  bool allSettled(const std::vector<std::pair<std::string, double>> & targets) const;
+  bool allSettled(const std::vector<std::pair<std::string, double>> & targets,
+                   std::optional<double> velocity_threshold_override = std::nullopt,
+                   std::optional<double> position_tolerance_override = std::nullopt) const;
   // isSettled()와 동일한 판정(속도+위치 임계값)을 tilt_position_/tilt_velocity_에
   // 대해 목표 0.0(레벨)로 확인 - motor_positions_ 맵을 안 쓰는 tilt 전용이라 별도로
   // 뺌. 모션 재생(motion_in_flight_)과 무관하게(목 모터는 motion_operator가 아니라
@@ -482,8 +497,22 @@ private:
   bool place_release_shoulder_pitch_commanded_ = false;
   // 위와 동일 이유(elbow_pitch 버전) - place_release_elbow_offset_rad 필드 주석 참고.
   bool place_release_elbow_commanded_ = false;
+  // 그리퍼를 열기 전 Cartesian 안전판(place_release_max_error_m 필드 주석,
+  // stepPlaceIk 참고)이 "한 번이라도" real_error <= place_release_max_error_m를
+  // 확인하면 true로 래치됨 - 그 뒤로는 매 tick 다시 검사 안 하고 그리퍼 오픈
+  // 시퀀스(어깨/팔꿈치 오프셋 포함)를 계속 진행함. 매 tick 계속 재검사하면, 그
+  // 오프셋 자체가 일부러 EE를 target_pos_에서 떨어뜨리는 동작이라 오프셋 적용 후
+  // real_error가 다시 max를 넘어서 이 가드가 q_를 되돌려버리는 충돌이 있었음
+  // (대화 참고 - 그리퍼 여는 동안 팔이 흔들리던 원인).
+  bool place_release_error_confirmed_ok_ = false;
   bool kick_settling_ = false;
   double gripper_position_ = 0.0;
+
+  // [실험] COMPLETE_PLACE 전용(stepCompletePlaceHoming 참고) - place_trajectory_를 IK로
+  // 되짚어가는 대신 q_를 두 지점(ready pose -> 완전 홈)에 직접 스냅하는 방식으로 바꾸면서
+  // 생긴 단계 추적용 플래그. false면 아직 ready pose(ik_tuning_.home_q_full) 도달
+  // 대기 중, true면 그 다음 완전 홈(0) 도달 대기 중(그 뒤 settled되면 모션 76 재생).
+  bool complete_place_reached_ready_pose_ = false;
 
   Phase prev_solve_phase_;
   PickState prev_solve_pick_state_;

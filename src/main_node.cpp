@@ -202,6 +202,12 @@ private:
     // 안전하게 들고 있는 자세로 IK를 재수렴시키는 거리(m).
     tuning.complete_grip_lift_z_m =
       declare_parameter<double>("pick.complete_grip_lift_z_m", 0.1);
+    // complete_grip_settle_*_threshold 필드 주석 참고 - COMPLETE_GRIP z+lift 목표
+    // settle 대기 전용(다른 곳의 허리/어깨 회전 대기엔 영향 없음).
+    tuning.complete_grip_settle_velocity_threshold =
+      declare_parameter<double>("pick.complete_grip_settle_velocity_threshold", 0.6);
+    tuning.complete_grip_settle_position_tolerance_rad =
+      declare_parameter<double>("pick.complete_grip_settle_position_tolerance_rad", 0.6);
     tuning.default_damping = declare_parameter<double>("ik.default_damping", ik::kDefaultDamping);
     tuning.min_damping = declare_parameter<double>("ik.min_damping", ik::kMinDamping);
     tuning.max_damping = declare_parameter<double>("ik.max_damping", ik::kMaxDamping);
