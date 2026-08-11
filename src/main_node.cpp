@@ -26,9 +26,9 @@
 #include "dynamixel_hardware_msgs/msg/dynamixel_control_msgs.hpp"
 #include "dynamixel_hardware_msgs/msg/dynamixel_msgs.hpp"
 #include "fsm.hpp"
-#include "geometry_msgs/msg/point32.hpp"
 #include "irc_humanoid_interfaces/msg/master2_vision_msg.hpp"
 #include "irc_humanoid_interfaces/msg/motion_operator.hpp"
+#include "irc_humanoid_interfaces/msg/vision2_mani_msg.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -39,9 +39,9 @@ using CallbackReturn =
 using dynamixel_hardware_msgs::msg::CurrentMotorStatus;
 using dynamixel_hardware_msgs::msg::DynamixelControlMsgs;
 using dynamixel_hardware_msgs::msg::DynamixelMsgs;
-using geometry_msgs::msg::Point32;
 using irc_humanoid_interfaces::msg::Master2VisionMsg;
 using irc_humanoid_interfaces::msg::MotionOperator;
+using irc_humanoid_interfaces::msg::Vision2ManiMsg;
 using rclcpp_lifecycle::State;
 using std_msgs::msg::Bool;
 using visualization_msgs::msg::Marker;
@@ -87,6 +87,9 @@ public:
   }
 
   CallbackReturn on_activate(const State &) override {
+    deactivate_pending_ = false;
+    deferred_deactivate_timer_.reset();
+
     // 모터 명령/상태는 매 주기 계속 갱신되는 스트림이라 최신 값만 중요 ->
     // BEST_EFFORT + depth=1.
     auto motor_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
@@ -113,11 +116,13 @@ public:
       status_topic_, motor_qos,
       [this](const CurrentMotorStatus::SharedPtr msg) {on_motor_status(msg);});
 
-    // master(task_planner)가 보내는 목표 좌표. 계속 갱신되는 스트림이지만 이산적
-    // 이벤트 성격도 있어 pub 쪽(depth=4)과 QoS를 맞춤.
-    mani_sub_ = create_subscription<Point32>(
-      "/master2mani", 4,
-      [this](const Point32::SharedPtr msg) {on_master2mani(msg);});
+    // 비전 노드가 보내는 원본 좌표(공/골대 x/y/z 둘 다 포함, mm 단위). master(task_planner)를
+    // 거치지 않고 직접 구독함 - on_vision2mani()에서 activate_count_ 홀짝으로 이번 활성화
+    // 사이클이 PICK(공)인지 PLACE(골대)인지 판단해서 그 값만 update_vision에 넘김.
+    ++activate_count_;
+    vision_sub_ = create_subscription<Vision2ManiMsg>(
+      "/vision2mani", rclcpp::QoS(10),
+      [this](const Vision2ManiMsg::SharedPtr msg) {on_vision2mani(msg);});
 
     // 모션 재생 요청/완료 통지는 유실되면 안 되는 이산적 이벤트 -> RELIABLE.
     auto motion_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
@@ -147,14 +152,20 @@ public:
   }
 
   CallbackReturn on_deactivate(const State &) override {
-    solve_timer_.reset();
+    // COMPLETE_PLACE 종료는 solve_timer_ 콜백 안에서 deactivate()를
+    // 호출한다. 그 시점에 현재 실행 중인 타이머를 reset()하면
+    // 콜백 객체가 해제되어 segfault가 날 수 있으므로 스케줄링만 취소한다.
+    // 다음 on_activate()의 대입 시점에는 이 콜백이 종료된 후라 안전하다.
+    if (solve_timer_) {
+      solve_timer_->cancel();
+    }
     control_pub_.reset();
     gripper_pub_.reset();
     pan_tilt_pub_.reset();
     target_marker_pub_.reset();
     trajectory_marker_pub_.reset();
     status_sub_.reset();
-    mani_sub_.reset();
+    vision_sub_.reset();
     motion_operator_pub_.reset();
     motion_end_sub_.reset();
 
@@ -164,7 +175,8 @@ public:
 
   CallbackReturn on_cleanup(const State &) override {
     activate_cmd_sub_.reset();
-    activate_cmd_pub_.reset();
+    activate_end_pub_.reset();
+    deferred_deactivate_timer_.reset();
     return CallbackReturn::SUCCESS;
   }
 
@@ -326,9 +338,9 @@ private:
       "activate_cmd", cmd_qos,
       [this](const Bool::SharedPtr msg) {on_activate_cmd(msg);});
 
-    // 픽 시퀀스(DONE)가 끝나서 스스로 deactivate할 때 task_planner에게
-    // false로 알려주는 용도 -> 같은 토픽/QoS로 짝을 맞춤.
-    activate_cmd_pub_ = create_publisher<Bool>("activate_cmd", cmd_qos);
+    // 픽/플레이스 시퀀스(DONE)가 끝나면 task_planner가 구독하는
+    // 종료 전용 토픽으로 통지한다. 시작 명령과 응답을 분리해 자기 수신을 막는다.
+    activate_end_pub_ = create_publisher<Bool>("activate_end", cmd_qos);
   }
 
   void on_activate_cmd(const Bool::SharedPtr msg) {
@@ -368,8 +380,17 @@ private:
     }
   }
 
-  void on_master2mani(const Point32::SharedPtr msg) {
-    fsm_->update_vision(msg->x, msg->y, msg->z);
+  // activate_count_는 on_activate()에서 매 활성화마다 1씩 늘어남 - 홀수 번째
+  // 활성화(1, 3, 5, ...)는 SIT에서 시작하는 PICK 사이클이라 공(ball_cam) 좌표가
+  // 필요하고, 짝수 번째(2, 4, 6, ...)는 DONE에서 재활성화되는 PLACE 사이클이라
+  // 골대(goal_post_cam) 좌표가 필요함(fsm.cpp의 onActivatedImpl 주석 참고).
+  // Vision2ManiMsg는 float64(mm 단위)라 1000.0으로 나누기만 하면 double 그대로 씀.
+  void on_vision2mani(const Vision2ManiMsg::SharedPtr msg) {
+    const bool is_pick_cycle = (activate_count_ % 2) == 1;
+    const double x = (is_pick_cycle ? msg->ball_cam_x : msg->goal_post_cam_x) / 1000.0;
+    const double y = (is_pick_cycle ? msg->ball_cam_y : msg->goal_post_cam_y) / 1000.0;
+    const double z = (is_pick_cycle ? msg->ball_cam_z : msg->goal_post_cam_z) / 1000.0;
+    fsm_->update_vision(x, y, z);
   }
 
   // 이벤트만 기록함(내부적으로 자체 락 보호) - 실제 처리(onMotionEndImpl)는
@@ -386,6 +407,12 @@ private:
   // tick엔 안 돌림. on_motor_feedback이 딱히 할 게 없을 때만 solve_tick을 돌려서
   // 그 결과를 적용함(한 tick에 모터 명령이 최대 1번만 나가게).
   void on_solve_tick() {
+    // COMPLETE_PLACE 완료 후 deactivate 콜백이 실행되기 전까지
+    // 다음 solve tick이 들어와도 FSM/퍼블리셔를 다시 건드리지 않는다.
+    if (deactivate_pending_) {
+      return;
+    }
+
     // 아래 분기들이 조기 return하더라도 매 tick 빠짐없이 갱신하고 싶어서 맨 앞에서 호출.
     publish_debug_markers();
 
@@ -495,10 +522,24 @@ private:
     }
 
     if (action.deactivate_and_notify) {
-      Bool activate_ack;
-      activate_ack.data = false;
-      activate_cmd_pub_->publish(activate_ack);
-      this->deactivate();
+      Bool activate_end;
+      activate_end.data = true;
+      activate_end_pub_->publish(activate_end);
+
+      // lifecycle deactivate()를 solve_timer_ 콜백 안에서 동기 호출하면
+      // executor/lifecycle이 현재 콜백의 타이머와 pub/sub를 정리하며
+      // use-after-free가 날 수 있다. 같은 MutuallyExclusive 콜백 그룹에
+      // one-shot 타이머를 예약해 현재 solve 콜백이 끝난 후 전환한다.
+      if (!deactivate_pending_) {
+        deactivate_pending_ = true;
+        deferred_deactivate_timer_ = create_wall_timer(
+          std::chrono::milliseconds(1),
+          [this]() {
+            deferred_deactivate_timer_->cancel();
+            this->deactivate();
+          },
+          solve_callback_group_);
+      }
     }
 
     if (action.reset_pan_tilt_level) {
@@ -511,18 +552,20 @@ private:
   }
 
   rclcpp::Subscription<Bool>::SharedPtr activate_cmd_sub_;
-  rclcpp::Publisher<Bool>::SharedPtr activate_cmd_pub_;
+  rclcpp::Publisher<Bool>::SharedPtr activate_end_pub_;
   rclcpp::Publisher<DynamixelControlMsgs>::SharedPtr control_pub_;
   rclcpp::Publisher<DynamixelMsgs>::SharedPtr gripper_pub_;
   rclcpp::Publisher<Master2VisionMsg>::SharedPtr pan_tilt_pub_;
   rclcpp::Publisher<Marker>::SharedPtr target_marker_pub_;
   rclcpp::Publisher<Marker>::SharedPtr trajectory_marker_pub_;
   rclcpp::Subscription<CurrentMotorStatus>::SharedPtr status_sub_;
-  rclcpp::Subscription<Point32>::SharedPtr mani_sub_;
+  rclcpp::Subscription<Vision2ManiMsg>::SharedPtr vision_sub_;
   rclcpp::Publisher<MotionOperator>::SharedPtr motion_operator_pub_;
   rclcpp::Subscription<MotionOperator>::SharedPtr motion_end_sub_;
   rclcpp::CallbackGroup::SharedPtr solve_callback_group_;
   rclcpp::TimerBase::SharedPtr solve_timer_;
+  rclcpp::TimerBase::SharedPtr deferred_deactivate_timer_;
+  bool deactivate_pending_ = false;
 
   std::unique_ptr<ManipulationFSM> fsm_;
 
@@ -531,6 +574,9 @@ private:
   std::string status_topic_;
   std::string pan_tilt_topic_;
   double step_period_sec_ = 0.02;
+  // on_activate()마다 1씩 증가 - on_vision2mani()가 이번이 몇 번째 활성화인지로
+  // ball_cam/goal_post_cam 중 어느 쪽을 넘길지 판단하는 데 씀.
+  int activate_count_ = 0;
 };
 
 int main(int argc, char ** argv) {

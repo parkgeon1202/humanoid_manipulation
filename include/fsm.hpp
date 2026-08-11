@@ -47,7 +47,7 @@ struct FsmAction
   // 필요(=락을 또 잡을 필요)가 없게 함("구조체에 관련 정보 몰빵" 요청 반영).
   std::unordered_map<std::string, double> motor_goal_positions;
   std::optional<int32_t> play_motion_number;  // set이면 motion_operator publish
-  bool deactivate_and_notify = false;  // deactivate() + activate_cmd(false) publish
+  bool deactivate_and_notify = false;  // activate_end(true) publish + deactivate()
   // true면 카메라를 레벨(tilt=0)로 되돌리는 PanTilt를 한 번 publish(pan은 안 건드림) -
   // 모션 75(DONE 재활성화 진입 모션) 종료 시점(onMotionEndImpl)에만 세팅됨.
   bool reset_pan_tilt_level = false;
