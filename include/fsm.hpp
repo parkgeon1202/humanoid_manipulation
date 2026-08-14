@@ -157,6 +157,12 @@ struct IkTuning
   // COMPLETE_PLACE 홈잉 정지 판정(main_node.yaml의 arm.settled_velocity_threshold 그대로).
   double arm_settled_velocity_threshold = 0.3;
 
+  // 그립 위글 복원(다시 오므리기) settle 대기가 이 틱 수를 넘으면 isSettled 결과와
+  // 무관하게 settle된 것으로 간주하고 넘어감 - 그리퍼가 물체를 물어서 목표
+  // 위치(gripper_closed_rad)까지 완전히 안 닫히는 경우 여기서 무한 대기하는 걸
+  // 막는 타임아웃.
+  int grip_wiggle_restore_timeout_ticks = 200;
+
   // VIRTUAL_PLACE의 place_trajectory_ 재생 시간을 매 틱 얼마나 진행시킬지(ik.step_period_sec와
   // 동일 값을 넣어서 씀 - solve_tick 호출 주기와 궤적 재생 속도를 맞추기 위함).
   double place_traj_dt_sec = 0.02;
@@ -523,6 +529,9 @@ private:
   bool pending_grip_wiggle_ = false;
   bool grip_wiggle_kicked_ = false;
   bool grip_wiggle_restore_commanded_ = false;
+  // grip_wiggle_restore_commanded_가 true가 된 뒤 isSettled 대기 중 흐른 틱 수 -
+  // ik_tuning_.grip_wiggle_restore_timeout_ticks 타임아웃 판정용.
+  int grip_wiggle_restore_wait_ticks_ = 0;
   double cached_grip_position_ = 0.0;
 
   // makeActionSnapshot()이 play_motion_number를 실어 보내면 true로 세팅되고,

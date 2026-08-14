@@ -23,6 +23,12 @@ manipulation_node_cpp:
     # 살짝 움직이는(kick) 목표각(rad).
     grip.wiggle_kick_position_rad: 0.2
 
+    # 그립 위글 복원(다시 오므리기) settle 대기가 이 틱 수를 넘으면 isSettled 결과와
+    # 무관하게 settle된 것으로 간주하고 넘어감 - 그리퍼가 물체를 물어서
+    # gripper_closed_rad까지 완전히 안 닫히는 경우 여기서 무한 대기하는 걸 막는
+    # 타임아웃.
+    grip.wiggle_restore_timeout_ticks: 200
+
     # --- 아래는 구 ik_solve_node.yaml에서 병합됨(ik_solve_node.py가 fsm.cpp로
     # 흡수되면서 별도 프로세스/yaml이 없어짐). 값은 debug_ik_node.yaml에서 이번
     # 세션에 실측으로 튜닝된 값과 동일하게 맞춤(같은 로봇이므로).

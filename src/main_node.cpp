@@ -125,7 +125,7 @@ public:
       [this](const Vision2ManiMsg::SharedPtr msg) {on_vision2mani(msg);});
 
     // 모션 재생 요청/완료 통지는 유실되면 안 되는 이산적 이벤트 -> RELIABLE.
-    auto motion_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
+    auto motion_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
     motion_operator_pub_ = create_publisher<MotionOperator>("motion_operator", motion_qos);
     motion_end_sub_ = create_subscription<MotionOperator>(
       "motion_end", motion_qos,
@@ -297,6 +297,8 @@ private:
       declare_parameter<double>("grip.wiggle_kick_position_rad", 1.0);
     tuning.grip_stopped_streak_ticks =
       declare_parameter<int>("grip.stopped_streak_ticks", 10);
+    tuning.grip_wiggle_restore_timeout_ticks =
+      declare_parameter<int>("grip.wiggle_restore_timeout_ticks", 200);
 
     // pick_ready_home_q/joint_weights는 실제로 명령되는 4개(torso_yaw + 왼팔)만
     // 받고, 오른팔/tilt는 model.nq(8) 크기로 패딩함(debug_ik_node.cpp와 동일 패턴).

@@ -5,9 +5,28 @@
 namespace ik
 {
 
-void Trajectory1D::put_point(double time, double pos, double vel, double acc)
+std::vector<double> estimateVelocities(
+  const std::vector<double> & times, const std::vector<double> & positions,
+  double v_start, double v_end)
 {
-  points_.push_back({time, pos, vel, acc});
+  const size_t n = times.size();
+  std::vector<double> vel(n, 0.0);
+  if (n == 0) {
+    return vel;
+  }
+  for (size_t i = 1; i + 1 < n; ++i) {
+    const double v_in = (positions[i] - positions[i - 1]) / (times[i] - times[i - 1]);
+    const double v_out = (positions[i + 1] - positions[i]) / (times[i + 1] - times[i]);
+    vel[i] = (v_in > 0.0) == (v_out > 0.0) ? 0.5 * (v_in + v_out) : 0.0;
+  }
+  vel.front() = v_start;
+  vel.back() = v_end;
+  return vel;
+}
+
+void Trajectory1D::put_point(double time, double pos)
+{
+  points_.push_back({time, pos});
   computeSegments();
 }
 
@@ -20,12 +39,32 @@ void Trajectory1D::clear()
 void Trajectory1D::computeSegments()
 {
   segments_.clear();
+  if (points_.size() < 2) {
+    return;
+  }
+
+  std::vector<double> times;
+  std::vector<double> positions;
+  times.reserve(points_.size());
+  positions.reserve(points_.size());
+  for (const auto & p : points_) {
+    times.push_back(p.time);
+    positions.push_back(p.pos);
+  }
+  // 경로 시작/끝은 정지(0)로 두고, 내부 점들은 IPTP식 중심차분으로 속도 추정
+  // (estimateVelocities() 참고).
+  const std::vector<double> vel =
+    estimateVelocities(times, positions, /*v_start=*/0.0, /*v_end=*/0.0);
+
   for (size_t i = 0; i + 1 < points_.size(); ++i) {
-    segments_.push_back(fifthOrderSegment(points_[i], points_[i + 1]));
+    segments_.push_back(fifthOrderSegment(
+        {times[i], positions[i], vel[i], /*acc=*/0.0},
+        {times[i + 1], positions[i + 1], vel[i + 1], /*acc=*/0.0}));
   }
 }
 
-Trajectory1D::Segment Trajectory1D::fifthOrderSegment(const DataPoint & f, const DataPoint & f1)
+Trajectory1D::Segment Trajectory1D::fifthOrderSegment(
+  const BoundaryCondition & f, const BoundaryCondition & f1)
 {
   const double p0 = f.pos, v0 = f.vel, a0 = f.acc, t0 = f.time;
   const double p1 = f1.pos, v1 = f1.vel, a1 = f1.acc, t1 = f1.time;
@@ -71,13 +110,11 @@ double Trajectory1D::result(double t) const
   return pos;
 }
 
-void TrajectoryGenerator::put_point(double time, double x, double y, double z,
-                                 double vx, double vy, double vz,
-                                 double ax, double ay, double az)
+void TrajectoryGenerator::put_point(double time, double x, double y, double z)
 {
-  traj_x_.put_point(time, x, vx, ax);
-  traj_y_.put_point(time, y, vy, ay);
-  traj_z_.put_point(time, z, vz, az);
+  traj_x_.put_point(time, x);
+  traj_y_.put_point(time, y);
+  traj_z_.put_point(time, z);
 }
 
 void TrajectoryGenerator::clear()

@@ -552,15 +552,24 @@ void ManipulationFSM::onMotorFeedbackImpl()
         // 잡았는지"만 확인하면 되므로 매번 같은 기준값을 씀.
         set_motor_goal_position(kGripMotorId, ik_tuning_.gripper_closed_rad);
         grip_wiggle_restore_commanded_ = true;
+        grip_wiggle_restore_wait_ticks_ = 0;
       }
-    } else if (isSettled(kGripMotorId, ik_tuning_.gripper_closed_rad)) {
-      //이제 그리퍼가 실제로 다시 오므려진 걸 확인함
-      pending_grip_wiggle_ = false;
-      grip_wiggle_kicked_ = false;
-      grip_wiggle_restore_commanded_ = false;
-      advance();  // COMPLETE_GRIP -> DONE
-      // 곧바로 deactivate하지 않음 - solveTickImpl()의 stepDoneHoming()이 왼팔을
-      // 한 번 더 home_q로 복귀시키고 settle까지 확인한 뒤에 deactivate함.
+    } else {
+      ++grip_wiggle_restore_wait_ticks_;
+      // 그리퍼가 물체를 물어서 gripper_closed_rad까지 실측이 못 좁혀지면 isSettled가
+      // 영영 안 될 수 있어서, grip_wiggle_restore_timeout_ticks 틱이 지나면 settle
+      // 여부와 무관하게 강제로 넘어감(무한 대기 방지).
+      if (isSettled(kGripMotorId, ik_tuning_.gripper_closed_rad) ||
+        grip_wiggle_restore_wait_ticks_ > ik_tuning_.grip_wiggle_restore_timeout_ticks)
+      {
+        //이제 그리퍼가 실제로 다시 오므려진 걸 확인함(또는 타임아웃으로 강제 진행)
+        pending_grip_wiggle_ = false;
+        grip_wiggle_kicked_ = false;
+        grip_wiggle_restore_commanded_ = false;
+        advance();  // COMPLETE_GRIP -> DONE
+        // 곧바로 deactivate하지 않음 - solveTickImpl()의 stepDoneHoming()이 왼팔을
+        // 한 번 더 home_q로 복귀시키고 settle까지 확인한 뒤에 deactivate함.
+      }
     }
     makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
@@ -641,8 +650,16 @@ void ManipulationFSM::onMotionEndImpl(bool ended)
 
   if (phase_ == Phase::PLACE && place_state_ == PlaceState::COMPLETE_PLACE) {
     // stepCompletePlaceHoming이 역재생 IK 수렴 + settle 확인 후 재생한 모션(76)이
-    // 끝난 시점 - 시퀀스 전체의 마지막이라 여기서 바로 deactivate.
-    makeActionSnapshot(/*publish_motor_command=*/false, /*profile_velocity=*/0.0,
+    // 끝난 시점 - 시퀀스 전체의 마지막이라 여기서 바로 deactivate. 다른 모션 종료
+    // 분기(SIT/DONE/COMPLETE_GRIP)와 동일하게 다리/반대팔은 그 시점 실측 위치로
+    // 고정해서 마지막 명령으로 함께 보냄.
+    for (const auto & id : kLegMotorIds) {
+      set_motor_goal_position(id, motor_position(id));
+    }
+    for (const auto & id : kOtherArmMotorIds) {
+      set_motor_goal_position(id, motor_position(id));
+    }
+    makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/0.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/true);
     return;
   }
@@ -759,50 +776,41 @@ void ManipulationFSM::solveTickImpl()
       has_captured_target_ = true;
 
       // 시작점(현재 EE, q_로 FK) -> 정점(장애물 회피, 고정 x/y 튜닝값) -> 목표(비전
-      // 캡처값) 3점 등록. z는 세 점 다 같은 vz를 줘서 시작~목표 전체 구간이 등속
-      // 직선이 되게 함(경계조건이 일치하면 quintic이 정확히 직선으로 퇴화함).
+      // 캡처값) 9점 등록. 각 점의 속도는 더 이상 여기서 손으로 안 찍고
+      // TrajectoryGenerator/Trajectory1D가 IPTP식으로 자동 추정함(estimateVelocities()
+      // 참고) - 이전에 z만 시작/끝 vel을 일치시켜 등속 직선으로 강제하던 트릭은 그
+      // 대가로 포기함(양 끝점 속도가 이제 항상 0으로 고정되므로). z 위치값 자체는
+      // 이전과 동일하게 등속 직선 근사(vz)로 계산.
       const Eigen::Vector3d start_pos = ik::eePosition(robot_model_, q_);
       const double duration = ik_tuning_.place_traj_duration_sec;
-   
+
       const double vz = (target_pos_.z() - start_pos.z()) / duration;
 
-      place_trajectory_.put_point(
-        0.0, start_pos.x(), start_pos.y(), start_pos.z(),
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+      place_trajectory_.put_point(0.0, start_pos.x(), start_pos.y(), start_pos.z());
       place_trajectory_.put_point(
         duration * 0.1, target_pos_.x()*0.1, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration * 0.1,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+        start_pos.z() + vz * duration * 0.1);
       place_trajectory_.put_point(
         duration * 0.2, target_pos_.x()*0.5, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration * 0.2,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+        start_pos.z() + vz * duration * 0.2);
       place_trajectory_.put_point(
         duration * 0.3, target_pos_.x()*0.8, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration * 0.3,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+        start_pos.z() + vz * duration * 0.3);
       place_trajectory_.put_point(
         duration * 0.5, target_pos_.x()*0.99-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration * 0.8,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/vz);
+        start_pos.z() + vz * duration * 0.8);
       place_trajectory_.put_point(
         duration * 0.7, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration * 1.0,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
+        start_pos.z() + vz * duration * 1.0);
       place_trajectory_.put_point(
         duration * 0.8, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration +  0.05,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
+        start_pos.z() + vz * duration +  0.05);
       place_trajectory_.put_point(
         duration * 0.9, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
-        start_pos.z() + vz * duration + 0.05,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
-
+        start_pos.z() + vz * duration + 0.05);
       place_trajectory_.put_point(
         duration, target_pos_.x()-0.05, target_pos_.y()+0.05,
-        start_pos.z() + vz * duration + 0.05,
-        /*vx=*/0.0, /*vy=*/0.0, /*vz=*/0.0);
-      
+        start_pos.z() + vz * duration + 0.05);
     }
     // 궤적이 아직 끝나지 않았으면(목표 지점 도달 전) target_pos_가 매 tick 계속
     // 움직이므로, 이전 tick에 ik_converged_가 true가 됐어도 다시 풀게 리셋함 -
@@ -940,7 +948,7 @@ void ManipulationFSM::stepDoneHoming(bool state_changed)
       {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
     });
 
-  makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+  makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/0.0,
                       /*play_motion_number=*/std::nullopt,
                       /*deactivate_and_notify=*/settled);
 }
@@ -1052,7 +1060,7 @@ void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
   if (settled) {
     motion = entry_motion_number();
   }
-  makeActionSnapshot(/*publish_motor_command=*/!settled, /*profile_velocity=*/settled ? 0.0 : 1.0,
+  makeActionSnapshot(/*publish_motor_command=*/!settled, /*profile_velocity=*/0.0,
                       /*play_motion_number=*/motion, /*deactivate_and_notify=*/false);
 }
 
@@ -1168,8 +1176,8 @@ void ManipulationFSM::stepPickReady(bool state_changed)
   // 이 시점엔 q_(torso + 왼팔 3개)가 다 확정됨 - 이 EE 위치 -> target_pos_(비전
   // 캡처값)를 곧장 damped-IK로 스텝하는 대신, 5차(quintic) 2점 경로로 미리 이어둠
   // (place_trajectory_와 동일 패턴, 정점 없이 시작->목표 직행 - 장애물 회피가
-  // 필요 없어서). vel/az 등은 TrajectoryGenerator::put_point 기본값(0.0) 그대로 둬서
-  // 양 끝 vel=acc=0인 minimum-jerk 프로파일이 되게 함.
+  // 필요 없어서). 점이 2개뿐이라 내부점이 없으므로 estimateVelocities()가 양 끝
+  // vel=acc=0인 minimum-jerk 프로파일을 그대로 만들어줌.
   const Eigen::Vector3d approach_start_pos = ik::eePosition(robot_model_, q_);
   pick_approach_trajectory_.clear();
   pick_approach_trajectory_.put_point(
