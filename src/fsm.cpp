@@ -825,17 +825,17 @@ void ManipulationFSM::solveTickImpl()
     // 계속 앞으로 흘러가버려서, 소프트웨어 목표가 실제 팔보다 앞서 나가며 궤적
     // 중간 지점들을 스치듯 지나쳐버림(그리퍼가 팔 도달 전에 열리던 문제와 같은
     // 원인 - kick_settling_과 동일 패턴).
-    if (!allSettled({
-        {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
-        {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
-        {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
-        {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
-      }))
-    {
-      makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
-                          /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
-      return;
-    }
+    // if (!allSettled({
+    //     {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
+    //     {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
+    //     {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
+    //     {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
+    //   }))
+    // {
+    //   makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+    //                       /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
+    //   return;
+    // }
 
     const bool trajectory_in_progress = place_traj_time_ < ik_tuning_.place_traj_duration_sec;
     target_pos_ = place_trajectory_.result(place_traj_time_);

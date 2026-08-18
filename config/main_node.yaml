@@ -76,7 +76,7 @@ manipulation_node_cpp:
     place.apex_x: 0.1
     place.apex_y: 0.2
     # 시작->정점->목표 전체 궤적 재생 시간(초).
-    place.traj_duration_sec: 1.0
+    place.traj_duration_sec: 3.0
 
     # VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, runDampedIkTick/stepPlaceIk 참고) - rho/
     # damping으로 "진짜 스텝을 밟았는지"부터 걸러낸 뒤에만 스트릭을 세므로(fsm.hpp
