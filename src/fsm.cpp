@@ -621,6 +621,14 @@ void ManipulationFSM::onMotionEndImpl(bool ended)
       for (const auto & id : kOtherArmMotorIds) {
         set_motor_goal_position(id, motor_position(id));
       }
+      // 다리/반대팔뿐 아니라 왼팔(torso+3관절)/그립까지 전부 이 순간 실측 위치로
+      // 고정 - 이 tick의 스냅샷이 motor_goal_positions_에 값이 없던(갱신 안 된)
+      // 모터를 이전 상태의 stale한 목표로 내보내는 걸 막음.
+      set_motor_goal_position(kTorsoMotorId, motor_position(kTorsoMotorId));
+      set_motor_goal_position(kLeftShoulderPitchMotorId, motor_position(kLeftShoulderPitchMotorId));
+      set_motor_goal_position(kLeftShoulderRollMotorId, motor_position(kLeftShoulderRollMotorId));
+      set_motor_goal_position(kLeftElbowMotorId, motor_position(kLeftElbowMotorId));
+      set_motor_goal_position(kGripMotorId, motor_position(kGripMotorId));
       makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
                           /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
       action_.reset_pan_tilt_level = true;
@@ -751,8 +759,15 @@ void ManipulationFSM::solveTickImpl()
       // (cached_grip_position_, COMPLETE_GRIP 모션 종료 시점에 캡처해둔 실측값)에서
       // 열기 시작해야 함 - 물건 두께에 따라 실제 그립 위치는 gripper_closed_rad와 다를 수 있음.
       gripper_position_ = cached_grip_position_;
-      // q_는 유지(PICK에서 물건을 잡은 자세 그대로 이어감). 회전 준비 단계
-      // 없이 비전을 캡처하는 즉시 도달 가능 IK로 들어감("공 놓으면 끝" 요구사항).
+      // q_를 PICK 마지막 IK 결과가 아니라 이 순간 실측 모터 위치로 다시 채움 - PICK
+      // 종료 후 모션(75) 재생 등을 거치며 실제 자세가 소프트웨어 q_보다 앞서
+      // 나갔을 수 있어서(대화 참고), 그 어긋남이 place_trajectory_ 시작점(FK 기준
+      // start_pos)에 그대로 반영되지 않게 함. 회전 준비 단계 없이 비전을 캡처하는
+      // 즉시 도달 가능 IK로 들어감("공 놓으면 끝" 요구사항).
+      q_[ik::kTorsoJointIndex] = motor_position(kTorsoMotorId);
+      q_[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId);
+      q_[ik::kLeftArmIndices[1]] = motor_position(kLeftShoulderRollMotorId);
+      q_[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId);
     }
     if (!has_captured_target_) {
       // 모션 75 종료 시 카메라를 레벨로 되돌리라고 명령했지만(onMotionEndImpl의
@@ -800,17 +815,17 @@ void ManipulationFSM::solveTickImpl()
         duration * 0.5, target_pos_.x()*0.99-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
         start_pos.z() + vz * duration * 0.8);
       place_trajectory_.put_point(
-        duration * 0.7, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
+        duration * 0.7, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y,
         start_pos.z() + vz * duration * 1.0);
       place_trajectory_.put_point(
-        duration * 0.8, target_pos_.x()-0.1, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration +  0.1);
+        duration * 0.8, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration +  0.08);
       place_trajectory_.put_point(
-        duration * 0.9, target_pos_.x()-0.1, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
-        start_pos.z() + vz * duration + 0.1);
+        duration * 0.9, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
+        start_pos.z() + vz * duration + 0.08);
       place_trajectory_.put_point(
-        duration, target_pos_.x()-0.1, target_pos_.y()+0.05,
-        start_pos.z() + vz * duration + 0.1);
+        duration, target_pos_.x()-0.08, target_pos_.y()+0.05,
+        start_pos.z() + vz * duration + 0.08);
     }
     // 궤적이 아직 끝나지 않았으면(목표 지점 도달 전) target_pos_가 매 tick 계속
     // 움직이므로, 이전 tick에 ik_converged_가 true가 됐어도 다시 풀게 리셋함 -
@@ -956,22 +971,21 @@ void ManipulationFSM::stepDoneHoming(bool state_changed)
 void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
 {
   if (state_changed) {
-    // [실험] place_trajectory_를 IK로 되짚어가는 대신, q_를 두 지점에 순서대로 직접
-    // 스냅하고 각각 실측 settle만 확인함(대화 참고) - 1단계: ready pose
-    // (ik_tuning_.home_q_full, yaml의 pick_ready_home_q). 2단계(아래 본문)는 완전
-    // 홈(0). 기존 IK 역재생 초기화/루프는 그대로 두되 전부 주석 처리해서 언제든
-    // 되돌릴 수 있게 함.
+    // [실험] place_trajectory_를 IK로 되짚어가는 대신, q_를 ready pose(ik_tuning_.home_q_full,
+    // yaml의 pick_ready_home_q)로 직접 스냅하고 실측 settle만 확인함(대화 참고) -
+    // 예전엔 그 뒤에 완전 홈(0)으로 한 번 더 스냅하고 다시 settle을 기다리는 2단계가
+    // 있었는데, ready pose 도달 확인만으로 충분하다고 판단해서 그 단계는 제거함(대화
+    // 참고 - 아래 본문). 기존 IK 역재생 초기화/루프는 그대로 두되 전부 주석 처리해서
+    // 언제든 되돌릴 수 있게 함.
     q_[ik::kTorsoJointIndex] = ik_tuning_.home_q_full[ik::kTorsoJointIndex];
     q_[ik::kLeftArmIndices[0]] = ik_tuning_.home_q_full[ik::kLeftArmIndices[0]];
-    // left_shoulder_roll은 home_q_full 값(0.3) 대신 1.0으로 고정(1단계/2단계 둘 다
-    // 동일하게 - 대화 참고).
+    // left_shoulder_roll은 home_q_full 값(0.3) 대신 1.0으로 고정(대화 참고).
     q_[ik::kLeftArmIndices[1]] = 1.0;
     q_[ik::kLeftArmIndices[2]] = ik_tuning_.home_q_full[ik::kLeftArmIndices[2]];
     set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
     set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
     set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
     set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
-    complete_place_reached_ready_pose_ = false;
 
     // 기존 IK 역재생용 초기화(주석 처리 - 대화 참고):
     // // VIRTUAL_PLACE는 그리퍼가 열릴 때까지 기다리는 동안에도 place_traj_time_을
@@ -1022,33 +1036,11 @@ void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
   //   return;
   // }
 
-  if (!complete_place_reached_ready_pose_) {
-    // 1단계: q_가 이미 ready pose로 스냅돼있으므로(위 state_changed), 실측이 거기
-    // 도달했는지만 확인. 도달했으면 2단계(완전 홈)로 q_를 다시 스냅하고 한 번만 명령.
-    const bool ready_settled = allSettled({
-        {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
-        {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
-        {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
-        {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
-      });
-    if (ready_settled) {
-      q_ = Eigen::VectorXd::Zero(robot_model_.model().nq);
-      // left_shoulder_roll은 여기서도 0.0 대신 1.0으로 고정(위 1단계와 동일 - 대화 참고).
-      q_[ik::kLeftArmIndices[1]] = 1.0;
-      set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
-      set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
-      set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
-      set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
-      complete_place_reached_ready_pose_ = true;
-    }
-    makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
-                        /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
-    return;
-  }
-
-  // 2단계: 완전 홈(0)에 실측이 도달했는지 확인한 뒤에야(stepCompleteGripHoming과
-  // 동일한 command-once + settle-poll 패턴) 모션(76)을 재생해서 전신(다리+반대팔
-  // 포함)을 최종 자세로 되돌림 - 모션이 끝나면 onMotionEndImpl이 deactivate함.
+  // ready pose(위 state_changed에서 스냅한 q_)에 실측이 도달했는지 확인한 뒤에야
+  // (stepCompleteGripHoming과 동일한 command-once + settle-poll 패턴) 모션(76)을
+  // 재생해서 전신(다리+반대팔 포함)을 최종 자세로 되돌림 - 모션이 끝나면
+  // onMotionEndImpl이 deactivate함. 완전 홈(0)으로 다시 스냅하고 별도로 settle을
+  // 기다리던 단계는 필요 없어져서 제거함(대화 참고).
   const bool settled = allSettled({
       {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
       {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
@@ -1060,7 +1052,7 @@ void ManipulationFSM::stepCompletePlaceHoming(bool state_changed)
   if (settled) {
     motion = entry_motion_number();
   }
-  makeActionSnapshot(/*publish_motor_command=*/!settled, /*profile_velocity=*/0.0,
+  makeActionSnapshot(/*publish_motor_command=*/!settled, /*profile_velocity=*/settled ? 0.0 : 1.0,
                       /*play_motion_number=*/motion, /*deactivate_and_notify=*/false);
 }
 

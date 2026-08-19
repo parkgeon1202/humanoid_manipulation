@@ -514,12 +514,6 @@ private:
   bool kick_settling_ = false;
   double gripper_position_ = 0.0;
 
-  // [실험] COMPLETE_PLACE 전용(stepCompletePlaceHoming 참고) - place_trajectory_를 IK로
-  // 되짚어가는 대신 q_를 두 지점(ready pose -> 완전 홈)에 직접 스냅하는 방식으로 바꾸면서
-  // 생긴 단계 추적용 플래그. false면 아직 ready pose(ik_tuning_.home_q_full) 도달
-  // 대기 중, true면 그 다음 완전 홈(0) 도달 대기 중(그 뒤 settled되면 모션 76 재생).
-  bool complete_place_reached_ready_pose_ = false;
-
   Phase prev_solve_phase_;
   PickState prev_solve_pick_state_;
   PlaceState prev_solve_place_state_;

@@ -76,7 +76,7 @@ manipulation_node_cpp:
     place.apex_x: 0.1
     place.apex_y: 0.2
     # 시작->정점->목표 전체 궤적 재생 시간(초).
-    place.traj_duration_sec: 6.0
+    place.traj_duration_sec: 5.0
 
     # VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, runDampedIkTick/stepPlaceIk 참고) - rho/
     # damping으로 "진짜 스텝을 밟았는지"부터 걸러낸 뒤에만 스트릭을 세므로(fsm.hpp
@@ -90,7 +90,7 @@ manipulation_node_cpp:
     # 그리퍼를 열기 전 마지막 Cartesian 안전판(fsm.hpp place_release_max_error_m 필드
     # 주석 참고) - 실측 관절값 기준 EE가 target_pos_에서 이 값보다 멀면 그리퍼를 안
     # 열고 재수렴시킴.
-    place.release_max_error_m: 0.1
+    place.release_max_error_m: 0.25
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.
