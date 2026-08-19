@@ -803,14 +803,14 @@ void ManipulationFSM::solveTickImpl()
         duration * 0.7, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
         start_pos.z() + vz * duration * 1.0);
       place_trajectory_.put_point(
-        duration * 0.8, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y,
-        start_pos.z() + vz * duration +  0.05);
+        duration * 0.8, target_pos_.x()-0.1, target_pos_.y() + ik_tuning_.place_apex_y,
+        start_pos.z() + vz * duration +  0.1);
       place_trajectory_.put_point(
-        duration * 0.9, target_pos_.x()-0.05, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
-        start_pos.z() + vz * duration + 0.05);
+        duration * 0.9, target_pos_.x()-0.1, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
+        start_pos.z() + vz * duration + 0.1);
       place_trajectory_.put_point(
-        duration, target_pos_.x()-0.05, target_pos_.y()+0.05,
-        start_pos.z() + vz * duration + 0.05);
+        duration, target_pos_.x()-0.1, target_pos_.y()+0.05,
+        start_pos.z() + vz * duration + 0.1);
     }
     // 궤적이 아직 끝나지 않았으면(목표 지점 도달 전) target_pos_가 매 tick 계속
     // 움직이므로, 이전 tick에 ik_converged_가 true가 됐어도 다시 풀게 리셋함 -

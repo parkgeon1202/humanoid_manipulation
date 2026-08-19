@@ -169,6 +169,14 @@ public:
     motion_operator_pub_.reset();
     motion_end_sub_.reset();
 
+    // 정상적으로 PLACE까지 끝난 경우에만 다음 공을 처리할 수 있도록 PICK 처음으로
+    // 되돌린다. 외부에서 activate_cmd(false)를 보내 작업 중간에 비활성화한 경우에는
+    // 진행 상태를 보존해 재활성화 시 이어서 수행한다.
+    if (fsm_->is_sequence_complete()) {
+      fsm_->reset();
+      RCLCPP_INFO(get_logger(), "Sequence complete. FSM reset for the next pick/place cycle.");
+    }
+
     RCLCPP_INFO(get_logger(), "Deactivated. Waiting for activate_cmd.");
     return CallbackReturn::SUCCESS;
   }
