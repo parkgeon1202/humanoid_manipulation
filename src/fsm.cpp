@@ -667,6 +667,11 @@ void ManipulationFSM::onMotionEndImpl(bool ended)
     for (const auto & id : kOtherArmMotorIds) {
       set_motor_goal_position(id, motor_position(id));
     }
+    // 왼팔(torso+3관절)도 이 순간 실측 위치로 고정해서 함께 보냄.
+    set_motor_goal_position(kTorsoMotorId, motor_position(kTorsoMotorId));
+    set_motor_goal_position(kLeftShoulderPitchMotorId, motor_position(kLeftShoulderPitchMotorId));
+    set_motor_goal_position(kLeftShoulderRollMotorId, motor_position(kLeftShoulderRollMotorId));
+    set_motor_goal_position(kLeftElbowMotorId, motor_position(kLeftElbowMotorId));
     makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/0.0,
                         /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/true);
     return;
