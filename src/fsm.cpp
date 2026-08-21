@@ -46,7 +46,7 @@ constexpr double kPlaceTolInitialM = 0.003;
 constexpr int kPlaceTolAdjustStreakTicks = 10;
 // place_tol_이 아무리 계속 못 수렴해도 이 이상은 안 풀어줌(관절 한계 등으로 영영
 // 도달 불가능한 목표를 만나도 오차 허용치가 끝없이 커지는 걸 막는 안전판).
-constexpr double kPlaceTolMaxM = 0.10;
+constexpr double kPlaceTolMaxM = 1.0;
 }  // namespace
 
 ManipulationFSM::ManipulationFSM(const std::string & urdf_path, const std::string & ee_frame)
@@ -101,13 +101,66 @@ bool ManipulationFSM::advance()
   return false;
 }
 
+// on_deactivate()가 부르는 전체 초기화 - COMPLETE_PLACE 종료(또는 그 밖의 deactivate)
+// 시점에 다음 활성화가 완전히 새 사이클처럼 시작하도록 이 인스턴스가 들고 있는 로직
+// 상태를 전부 되돌림. motor_positions_/motor_velocities_/tilt_position_/tilt_velocity_는
+// 일부러 안 건드림 - 하드웨어 실측을 그대로 반영하는 캐시라, 여기서 비우면 재활성화
+// 직후 첫 motor_status/pan_tilt 콜백이 오기 전까지 motor_position() 등이 0.0으로
+// 잘못 읽혀서 그 값 그대로 모터에 명령이 나갈 위험이 있음(on_deactivate에서 구독
+// 자체를 끊었다가 on_activate가 다시 구독하므로 곧 새 값으로 덮어써짐).
+// prev_solve_phase_/pick_state_/place_state_도 일부러 안 건드림 - 여기서 리셋한
+// phase_/pick_state_/place_state_와 일부러 다르게(stale) 남겨둬야 다음 첫 solve_tick이
+// state_changed=true로 정상 판정됨(solveTickImpl 참고) - 여기서 맞춰버리면 그 tick의
+// state_changed가 false로 새서 각 단계 진입 초기화가 스킵됨.
 void ManipulationFSM::reset()
 {
   phase_ = Phase::PICK;
   pick_state_ = PickState::SIT;
   place_state_ = PlaceState::VIRTUAL_PLACE;
+
   grip_motor_was_moving_ = false;
+  grip_stopped_streak_ = 0;
   motor_goal_positions_.clear();
+
+  resetVisionSampleAccumulator();
+  discardPendingVision();
+  tilt_settle_vision_discarded_ = false;
+  take_pending_motion_end();
+
+  q_ = Eigen::VectorXd::Zero(robot_model_.model().nq);
+  active_joint_weights_ = Eigen::VectorXd::Zero(robot_model_.model().nq);
+  active_joint_weight_scale_ = 0.0;
+  damping_ = ik_tuning_.default_damping;
+  target_pos_.setZero();
+  has_captured_target_ = false;
+
+  torso_bias_commanded_ = false;
+  pick_ready_q_latched_ = false;
+  pick_ready_latched_q_.setZero();
+
+  pick_approach_trajectory_.clear();
+  pick_approach_traj_time_ = 0.0;
+
+  place_trajectory_.clear();
+  place_traj_time_ = 0.0;
+  ik_converged_ = false;
+  stuck_streak_ = 0;
+  place_tol_ = 0.0;
+  place_tol_success_streak_ = 0;
+  place_tol_fail_streak_ = 0;
+  place_release_shoulder_pitch_commanded_ = false;
+  place_release_elbow_commanded_ = false;
+  place_release_error_confirmed_ok_ = false;
+  kick_settling_ = false;
+  gripper_position_ = ik_tuning_.gripper_open_rad;
+
+  pending_grip_wiggle_ = false;
+  grip_wiggle_kicked_ = false;
+  grip_wiggle_restore_commanded_ = false;
+  grip_wiggle_restore_wait_ticks_ = 0;
+  cached_grip_position_ = 0.0;
+
+  motion_in_flight_ = false;
 }
 
 Phase ManipulationFSM::phase() const
@@ -546,7 +599,10 @@ void ManipulationFSM::onMotorFeedbackImpl()
       set_motor_goal_position(kLeftElbowMotorId, motor_position(kLeftElbowMotorId));
       grip_wiggle_kicked_ = true;
     } else if (!grip_wiggle_restore_commanded_) {
-      if (isSettled(kGripMotorId, ik_tuning_.grip_wiggle_kick_position_rad)) {
+      if (isSettled(kGripMotorId, ik_tuning_.grip_wiggle_kick_position_rad,
+        ik_tuning_.grip_wiggle_kick_settle_velocity_threshold,
+        ik_tuning_.grip_wiggle_kick_settle_position_tolerance_rad))
+      {
         // 위글 복원 목표는 cached_grip_position_(그 순간 실측값)이 아니라 그냥
         // gripper_closed_rad(yaml 설정값)로 고정 - 위글은 "실제로 다시 오므려
         // 잡았는지"만 확인하면 되므로 매번 같은 기준값을 씀.

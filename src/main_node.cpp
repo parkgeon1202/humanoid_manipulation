@@ -307,6 +307,10 @@ private:
       declare_parameter<int>("grip.stopped_streak_ticks", 10);
     tuning.grip_wiggle_restore_timeout_ticks =
       declare_parameter<int>("grip.wiggle_restore_timeout_ticks", 200);
+    tuning.grip_wiggle_kick_settle_velocity_threshold =
+      declare_parameter<double>("grip.wiggle_kick_settle_velocity_threshold", 0.2);
+    tuning.grip_wiggle_kick_settle_position_tolerance_rad =
+      declare_parameter<double>("grip.wiggle_kick_settle_position_tolerance_rad", 0.1);
 
     // pick_ready_home_q/joint_weights는 실제로 명령되는 4개(torso_yaw + 왼팔)만
     // 받고, 오른팔/tilt는 model.nq(8) 크기로 패딩함(debug_ik_node.cpp와 동일 패턴).

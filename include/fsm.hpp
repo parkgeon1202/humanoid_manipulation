@@ -163,6 +163,13 @@ struct IkTuning
   // 막는 타임아웃.
   int grip_wiggle_restore_timeout_ticks = 200;
 
+  // 그립 위글 kick(그리퍼를 잠깐 벌리는) 단계가 실제로 그 위치까지 도달했는지 확인할
+  // 전용 settle 임계값 - 공용 ik.torso_settle_*(현재 0.3rad로 느슨하게 잡혀있음)을
+  // 그대로 쓰면 실제로는 별로 안 벌어졌는데도 settle로 오판할 여지가 있어서, 이 확인만
+  // 더 타이트하게 따로 둠.
+  double grip_wiggle_kick_settle_velocity_threshold = 0.2;
+  double grip_wiggle_kick_settle_position_tolerance_rad = 0.1;
+
   // VIRTUAL_PLACE의 place_trajectory_ 재생 시간을 매 틱 얼마나 진행시킬지(ik.step_period_sec와
   // 동일 값을 넣어서 씀 - solve_tick 호출 주기와 궤적 재생 속도를 맞추기 위함).
   double place_traj_dt_sec = 0.02;
