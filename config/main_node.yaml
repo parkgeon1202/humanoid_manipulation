@@ -99,6 +99,11 @@ manipulation_node_cpp:
     # 열고 재수렴시킴.
     place.release_max_error_m: 0.25
 
+    # 그리퍼 오픈 시퀀스 마지막에 torso_yaw를 이 각도(도)만큼 kick했다가 원래 자리로
+    # 되돌림 - 혹시 공이 그리퍼에 걸려있으면 확실히 떨어뜨리기 위함(fsm.hpp
+    # place_release_torso_kick_rad 필드 주석 참고).
+    place.release_torso_kick_deg: 10.0
+
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.
     pick.approach_duration_sec: 1.0

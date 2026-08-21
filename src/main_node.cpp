@@ -256,12 +256,17 @@ private:
     // 추가 회전(도).
     const double place_release_elbow_offset_deg =
       declare_parameter<double>("gripper.place_release_elbow_offset_deg", 30.0);
+    // place_release_torso_kick_rad 필드 주석 참고 - 그리퍼 오픈 시퀀스 마지막에
+    // torso_yaw를 이 각도(도)만큼 kick했다가 원래 자리로 되돌림.
+    const double place_release_torso_kick_deg =
+      declare_parameter<double>("place.release_torso_kick_deg", 10.0);
     tuning.gripper_open_rad = gripper_open_deg * M_PI / 180.0;
     tuning.gripper_closed_rad = gripper_closed_deg * M_PI / 180.0;
     tuning.place_gripper_open_rad = place_gripper_open_deg * M_PI / 180.0;
     tuning.place_release_shoulder_pitch_offset_rad =
       place_release_shoulder_pitch_offset_deg * M_PI / 180.0;
     tuning.place_release_elbow_offset_rad = place_release_elbow_offset_deg * M_PI / 180.0;
+    tuning.place_release_torso_kick_rad = place_release_torso_kick_deg * M_PI / 180.0;
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.

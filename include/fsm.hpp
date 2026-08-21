@@ -125,6 +125,11 @@ struct IkTuning
   // 이만큼(rad) 같이 돌림 - shoulder_pitch만으로 부족할 때 팔꿈치까지 보태서
   // 프레임을 확실히 그리퍼 아래쪽에서 빼냄.
   double place_release_elbow_offset_rad = 0.0;
+  // 그리퍼가 열리고 어깨/팔꿈치 오프셋까지 다 settle된 뒤 - 혹시 공이 그리퍼에
+  // 걸려있으면 확실히 떨어뜨리려고 torso_yaw를 이 각도(rad)만큼 한 번 돌렸다가
+  // (kick) 다시 원래 자리로 되돌리는(restore) 동작에 씀(stepPlaceIk 참고). 갈 때/
+  // 올 때 둘 다 실측 settle을 확인한 뒤에만 다음 단계(복귀/advance)로 넘어감.
+  double place_release_torso_kick_rad = 0.1745;
 
   // 정체 킥 때 어깨 롤을 이 각도로 리셋함(elbow_kick_rad/left_shoulder_pitch_kick_rad와
   // 짝, kick 전용).
@@ -518,6 +523,13 @@ private:
   // real_error가 다시 max를 넘어서 이 가드가 q_를 되돌려버리는 충돌이 있었음
   // (대화 참고 - 그리퍼 여는 동안 팔이 흔들리던 원인).
   bool place_release_error_confirmed_ok_ = false;
+  // 그리퍼 오픈 시퀀스 마지막의 torso_yaw kick->restore(place_release_torso_kick_rad
+  // 필드 주석 참고) 진행 상태 - kicked만 true면 kick 위치로 이동 중/settle 대기,
+  // restore_commanded까지 true면 원래 자리(place_release_torso_base_rad_)로 복귀
+  // 중/settle 대기. 이 restore까지 settle된 뒤에야 advance()를 부름.
+  bool place_release_torso_kicked_ = false;
+  bool place_release_torso_restore_commanded_ = false;
+  double place_release_torso_base_rad_ = 0.0;
   bool kick_settling_ = false;
   double gripper_position_ = 0.0;
 

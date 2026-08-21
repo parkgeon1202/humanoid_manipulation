@@ -804,6 +804,8 @@ void ManipulationFSM::solveTickImpl()
       place_release_shoulder_pitch_commanded_ = false;
       place_release_elbow_commanded_ = false;
       place_release_error_confirmed_ok_ = false;
+      place_release_torso_kicked_ = false;
+      place_release_torso_restore_commanded_ = false;
       kick_settling_ = false;
       ik_converged_ = false;
       has_captured_target_ = false;
@@ -1552,7 +1554,29 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
             ik_tuning_.complete_grip_settle_velocity_threshold,
             ik_tuning_.complete_grip_settle_position_tolerance_rad))
         {
-          advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
+          // 그리퍼/어깨/팔꿈치가 다 settle된 뒤 - 혹시 공이 그리퍼에 걸려있으면
+          // 확실히 떨어뜨리려고 torso_yaw를 한 번 kick했다가 원래 자리로 되돌림
+          // (그립 위글과 동일한 command-once + settle-poll 패턴). 갈 때/올 때
+          // 둘 다 실측 settle을 확인한 뒤에야 다음 단계로 넘어감.
+          if (!place_release_torso_kicked_) {
+            place_release_torso_base_rad_ = q_[ik::kTorsoJointIndex];
+            q_[ik::kTorsoJointIndex] =
+              place_release_torso_base_rad_ + ik_tuning_.place_release_torso_kick_rad;
+            place_release_torso_kicked_ = true;
+          } else if (!place_release_torso_restore_commanded_) {
+            if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
+                ik_tuning_.complete_grip_settle_velocity_threshold,
+                ik_tuning_.complete_grip_settle_position_tolerance_rad))
+            {
+              q_[ik::kTorsoJointIndex] = place_release_torso_base_rad_;
+              place_release_torso_restore_commanded_ = true;
+            }
+          } else if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
+              ik_tuning_.complete_grip_settle_velocity_threshold,
+              ik_tuning_.complete_grip_settle_position_tolerance_rad))
+          {
+            advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
+          }
         }
       }
     }
