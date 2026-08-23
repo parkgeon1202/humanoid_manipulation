@@ -130,6 +130,11 @@ struct IkTuning
   // (kick) 다시 원래 자리로 되돌리는(restore) 동작에 씀(stepPlaceIk 참고). 갈 때/
   // 올 때 둘 다 실측 settle을 확인한 뒤에만 다음 단계(복귀/advance)로 넘어감.
   double place_release_torso_kick_rad = 0.1745;
+  // 위 torso_yaw kick/restore 둘 다의 settle 확인 전용 임계값 - 공용
+  // complete_grip_settle_*(0.6rad)로는 너무 느슨해서 실제로 kick/restore가 거의 안
+  // 된 상태에서도 settle로 오판할 수 있어 훨씬 타이트하게 따로 둠.
+  double place_release_torso_settle_velocity_threshold = 0.1;
+  double place_release_torso_settle_position_tolerance_rad = 0.05;
 
   // 정체 킥 때 어깨 롤을 이 각도로 리셋함(elbow_kick_rad/left_shoulder_pitch_kick_rad와
   // 짝, kick 전용).

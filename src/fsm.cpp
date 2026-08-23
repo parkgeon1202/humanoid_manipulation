@@ -1401,6 +1401,10 @@ void ManipulationFSM::stepPickIk()
 
 void ManipulationFSM::stepPlaceIk(bool opening_gripper)
 {
+  // torso kick/restore 시퀀스(아래 opening_gripper 분기) 동안만 0.0으로 낮춤 - 그
+  // 외에는 기존과 동일하게 1.0.
+  double profile_velocity = 1.0;
+
   if (!ik_converged_) {
     const double damping_before = damping_;
     const std::optional<ik::IkStepResult> result = runDampedIkTick(place_tol_);
@@ -1524,30 +1528,38 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
           ik_tuning_.complete_grip_settle_velocity_threshold,
           ik_tuning_.complete_grip_settle_position_tolerance_rad))
       {
-        // 그리퍼/어깨/팔꿈치가 다 settle된 뒤 - 혹시 공이 그리퍼에 걸려있으면
-        // 확실히 떨어뜨리려고 torso_yaw를 한 번 kick했다가 원래 자리로 되돌림
-        // (그립 위글과 동일한 command-once + settle-poll 패턴). 갈 때/올 때
-        // 둘 다 실측 settle을 확인한 뒤에야 다음 단계로 넘어감.
+        // 어깨/팔꿈치가 다 settle된 뒤 - 그리퍼 오픈 명령.
         gripper_position_ = ik_tuning_.place_gripper_open_rad;
 
-        if (!place_release_torso_kicked_) {
-          place_release_torso_base_rad_ = q_[ik::kTorsoJointIndex];
-          q_[ik::kTorsoJointIndex] =
-            place_release_torso_base_rad_ + ik_tuning_.place_release_torso_kick_rad;
-          place_release_torso_kicked_ = true;
-        } else if (!place_release_torso_restore_commanded_) {
-          if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
-              ik_tuning_.complete_grip_settle_velocity_threshold,
-              ik_tuning_.complete_grip_settle_position_tolerance_rad))
-          {
-            q_[ik::kTorsoJointIndex] = place_release_torso_base_rad_;
-            place_release_torso_restore_commanded_ = true;
-          }
-        } else if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
+        // 그리퍼가 실제로 open 위치까지 도달한 뒤에야 - 혹시 공이 그리퍼에
+        // 걸려있으면 확실히 떨어뜨리려고 torso_yaw를 한 번 kick했다가 원래 자리로
+        // 되돌림(그립 위글과 동일한 command-once + settle-poll 패턴). 그리퍼 자체의
+        // settle, kick 갈 때, kick에서 돌아올 때 - 셋 다 실측 settle을 확인한
+        // 뒤에야 다음 단계로 넘어감.
+        if (isSettled(kGripMotorId, ik_tuning_.place_gripper_open_rad,
             ik_tuning_.complete_grip_settle_velocity_threshold,
             ik_tuning_.complete_grip_settle_position_tolerance_rad))
         {
-          advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
+          profile_velocity = 0.0;
+          if (!place_release_torso_kicked_) {
+            place_release_torso_base_rad_ = q_[ik::kTorsoJointIndex];
+            q_[ik::kTorsoJointIndex] =
+              place_release_torso_base_rad_ + ik_tuning_.place_release_torso_kick_rad;
+            place_release_torso_kicked_ = true;
+          } else if (!place_release_torso_restore_commanded_) {
+            if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
+                ik_tuning_.place_release_torso_settle_velocity_threshold,
+                ik_tuning_.place_release_torso_settle_position_tolerance_rad))
+            {
+              q_[ik::kTorsoJointIndex] = place_release_torso_base_rad_;
+              place_release_torso_restore_commanded_ = true;
+            }
+          } else if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
+              ik_tuning_.place_release_torso_settle_velocity_threshold,
+              ik_tuning_.place_release_torso_settle_position_tolerance_rad))
+          {
+            advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
+          }
         }
       }
     }
@@ -1564,6 +1576,6 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
   set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
   set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
   set_motor_goal_position(kGripMotorId, gripper_position_);
-  makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
+  makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/profile_velocity,
                       /*play_motion_number=*/std::nullopt, /*deactivate_and_notify=*/false);
 }

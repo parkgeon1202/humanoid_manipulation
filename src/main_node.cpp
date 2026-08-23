@@ -267,6 +267,10 @@ private:
       place_release_shoulder_pitch_offset_deg * M_PI / 180.0;
     tuning.place_release_elbow_offset_rad = place_release_elbow_offset_deg * M_PI / 180.0;
     tuning.place_release_torso_kick_rad = place_release_torso_kick_deg * M_PI / 180.0;
+    tuning.place_release_torso_settle_velocity_threshold =
+      declare_parameter<double>("place.release_torso_settle_velocity_threshold", 0.1);
+    tuning.place_release_torso_settle_position_tolerance_rad =
+      declare_parameter<double>("place.release_torso_settle_position_tolerance_rad", 0.05);
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.
