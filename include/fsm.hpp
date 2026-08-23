@@ -116,16 +116,13 @@ struct IkTuning
   // 진입 시 미리 벌려두는 gripper_open_rad와 별개 값. 그냥 집을 때보다 확실히
   // 떨어뜨리려면 더 크게 벌려야 할 수 있어서 따로 뺌.
   double place_gripper_open_rad = 0.0;
-  // VIRTUAL_PLACE에서 그리퍼를 벌릴 때 left_shoulder_pitch도 그 순간 실측값 기준으로
-  // 이만큼(rad) 같이 돌림(stepPlaceIk 참고) - 그리퍼 모터와 연결된 프레임이
-  // 놓는 자세에서 그리퍼 아래쪽으로 가버려서 모터만 돌아가고 실제로는 안 놓아지는
-  // 문제 대응(어깨를 더 돌려서 프레임 위치를 바꿔줌).
-  double place_release_shoulder_pitch_offset_rad = 0.0;
-  // 위와 동일 시점(그리퍼 벌릴 때 한 번)에 elbow_pitch도 그 순간 실측값 기준으로
-  // 이만큼(rad) 같이 돌림 - shoulder_pitch만으로 부족할 때 팔꿈치까지 보태서
-  // 프레임을 확실히 그리퍼 아래쪽에서 빼냄.
-  double place_release_elbow_offset_rad = 0.0;
-  // 그리퍼가 열리고 어깨/팔꿈치 오프셋까지 다 settle된 뒤 - 혹시 공이 그리퍼에
+  // VIRTUAL_PLACE 그리퍼 오픈 시퀀스가 "놓는 자세"로 수렴시킬 때 씀(ik::orientationAlignStep의
+  // tol = 1.0 - 이 값, stepPlaceIk 참고) - gripper 로컬 +X축을 world +Z에 맞춤
+  // (torso_yaw+왼팔 3관절, 대화 참고). 예전엔 shoulder_pitch/elbow에 고정 offset을
+  // 한 번만 더하는 방식 -> 그다음 고정 step gradient descent를 매 tick 더하는 방식을
+  // 거쳐, 지금은 ikStep과 동일한 damped least squares + trust-region으로 수렴시킴.
+  double place_release_orientation_align_threshold = 0.95;
+  // 그리퍼가 열리고 orientation 정렬까지 다 settle된 뒤 - 혹시 공이 그리퍼에
   // 걸려있으면 확실히 떨어뜨리려고 torso_yaw를 이 각도(rad)만큼 한 번 돌렸다가
   // (kick) 다시 원래 자리로 되돌리는(restore) 동작에 씀(stepPlaceIk 참고). 갈 때/
   // 올 때 둘 다 실측 settle을 확인한 뒤에만 다음 단계(복귀/advance)로 넘어감.
@@ -519,17 +516,19 @@ private:
   double place_tol_ = 0.0;  // 0.0이면 "아직 초기화 안 됨" - state_changed에서 세팅.
   int place_tol_success_streak_ = 0;
   int place_tol_fail_streak_ = 0;
-  // VIRTUAL_PLACE 놓기 전용(stepPlaceIk 참고) - 그리퍼를 벌리기 시작하는 순간
-  // 딱 한 번만 그 시점 실측 left_shoulder_pitch + offset을 q_[kLeftArmIndices[0]]에
-  // 바로 대입해서 고정해둠(매 tick 다시 읽으면 목표 자체가 계속 움직여서 isSettled가
-  // 영영 안 됨) - 목표값 자체는 q_ 안에 있으므로 별도 필드로 안 둠.
-  bool place_release_shoulder_pitch_commanded_ = false;
-  // 위와 동일 이유(elbow_pitch 버전) - place_release_elbow_offset_rad 필드 주석 참고.
-  bool place_release_elbow_commanded_ = false;
+  // VIRTUAL_PLACE 놓기 전용(stepPlaceIk 참고) - ik::eeXAxisUpAlignment 정렬 스코어가
+  // place_release_orientation_align_threshold를 넘으면 true로 래치되고, 그 뒤로는
+  // q_에 더 이상 orientation 보정 dq를 안 더함.
+  bool place_release_orientation_aligned_ = false;
+  // 위 orientationAlignStep 전용 damping - 메인 IK 루프의 damping_과 동일한 역할이지만
+  // 별도 상태로 둠(메인 IK는 이 시점에 이미 ik_converged_라 안 돎). max_damping까지
+  // 올라가면(=이 4 DOF로는 도저히 못 맞추는 자세) stepPlaceIk가 그 이상 기다리지 않고
+  // place_release_orientation_aligned_를 강제로 true로 래치함.
+  double place_release_orientation_damping_ = ik::kDefaultDamping;
   // 그리퍼를 열기 전 실측 팔(joint space) settle 확인(stepPlaceIk의 allSettled
   // 참고)이 한 번이라도 통과하면 true로 래치됨 - 그 뒤로는 매 tick 다시 검사 안 하고
-  // 그리퍼 오픈 시퀀스(어깨/팔꿈치 오프셋 포함)를 계속 진행함. 매 tick 계속
-  // 재검사하면, 그 오프셋 자체가 일부러 EE를 목표에서 떨어뜨리는 동작이라 오프셋
+  // 그리퍼 오픈 시퀀스(orientation 정렬 포함)를 계속 진행함. 매 tick 계속
+  // 재검사하면, 그 정렬 자체가 일부러 EE를 목표에서 떨어뜨리는 동작이라 정렬
   // 적용 후 실측이 다시 allSettled 기준을 벗어나서 이 가드가 계속 대기 분기로
   // 되돌리는 충돌이 있었음(대화 참고 - 그리퍼 여는 동안 팔이 흔들리던 원인).
   bool place_release_arm_settled_confirmed_ = false;

@@ -148,8 +148,8 @@ void ManipulationFSM::reset()
   place_tol_ = 0.0;
   place_tol_success_streak_ = 0;
   place_tol_fail_streak_ = 0;
-  place_release_shoulder_pitch_commanded_ = false;
-  place_release_elbow_commanded_ = false;
+  place_release_orientation_aligned_ = false;
+  place_release_orientation_damping_ = ik_tuning_.default_damping;
   place_release_arm_settled_confirmed_ = false;
   place_release_torso_kicked_ = false;
   place_release_torso_restore_commanded_ = false;
@@ -805,8 +805,8 @@ void ManipulationFSM::solveTickImpl()
       place_tol_ = kPlaceTolInitialM;
       place_tol_success_streak_ = 0;
       place_tol_fail_streak_ = 0;
-      place_release_shoulder_pitch_commanded_ = false;
-      place_release_elbow_commanded_ = false;
+      place_release_orientation_aligned_ = false;
+      place_release_orientation_damping_ = ik_tuning_.default_damping;
       place_release_arm_settled_confirmed_ = false;
       place_release_torso_kicked_ = false;
       place_release_torso_restore_commanded_ = false;
@@ -891,7 +891,7 @@ void ManipulationFSM::solveTickImpl()
         duration * 0.9, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
         start_pos.z() + vz * duration + 0.08);
       place_trajectory_.put_point(
-        duration, target_pos_.x()-0.08, target_pos_.y()+0.05,
+        duration, target_pos_.x()-0.08, target_pos_.y(),
         start_pos.z() + vz * duration + 0.08);
     }
     // 궤적이 아직 끝나지 않았으면(목표 지점 도달 전) target_pos_가 매 tick 계속
@@ -1497,38 +1497,53 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
 
       // place_gripper_open_rad 필드 주석 참고 - PICK_READY 진입용 gripper_open_rad와
       // 별개 값(놓을 때 확실히 떨어뜨리려고 더 크게 벌릴 수 있음). 실제 명령은 아래
-      // 어깨/팔꿈치 오프셋까지 settle된 뒤에 나감.
-      // place_release_shoulder_pitch_commanded_ 필드 주석 참고 - 그리퍼 모터와 연결된
-      // 프레임이 놓는 자세에서 그리퍼 아래쪽으로 가버려서 모터만 돌고 실제로는 안
-      // 놓아지는 문제 대응. 이 분기에 처음 들어온 tick에만(딱 한 번) 그 순간 실측
-      // left_shoulder_pitch + offset을 q_에 바로 대입해서 고정 - 매 tick 다시 읽으면
-      // 목표 자체가 계속 움직여서 isSettled가 영영 안 됨(IK는 이미 안 도니 그 뒤로
-      // q_가 다른 데서 안 바뀜 - 아래 set_motor_goal_position이 그대로 이 값을 씀).
-      if (!place_release_shoulder_pitch_commanded_) {
-        q_[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId) +
-          ik_tuning_.place_release_shoulder_pitch_offset_rad;
-        place_release_shoulder_pitch_commanded_ = true;
-      }
-      // shoulder_pitch만으로 안 빠지는 경우 대비 - 동일 패턴(딱 한 번, 실측값 +
-      // offset)으로 elbow_pitch도 같이 돌림(place_release_elbow_offset_rad 필드 주석 참고).
-      if (!place_release_elbow_commanded_) {
-        q_[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId) +
-          ik_tuning_.place_release_elbow_offset_rad;
-        place_release_elbow_commanded_ = true;
+      // orientation 정렬까지 settle된 뒤에 나감.
+      // 고정 offset을 한 번만 더하던 예전 방식, 그다음 고정 step gradient descent를
+      // 매 tick 그냥 더하던 방식(대화 참고 - threshold를 못 넘는 자세에서 계속
+      // 진동하는 문제가 있었음) 둘 다 대신, ikStep과 동일한 damped least squares +
+      // trust-region 구조(orientationAlignStep)로 gripper 로컬 +X축을 world +Z에
+      // 정렬시킴 - damping이 rho를 보고 스텝 크기를 자동 조절해서 못 넘는
+      // 상황에서도 damping이 상한까지 올라가며 진동 없이 멈춤(main IK 루프의
+      // damping_ >= max_damping 처리와 동일 패턴).
+      if (!place_release_orientation_aligned_) {
+        ik::IkStepParams orientation_params;
+        orientation_params.tol = 1.0 - ik_tuning_.place_release_orientation_align_threshold;
+        orientation_params.alpha = ik_tuning_.alpha;
+        orientation_params.min_damping = ik_tuning_.min_damping;
+        orientation_params.max_damping = ik_tuning_.max_damping;
+        orientation_params.damping_decrease_factor = ik_tuning_.damping_decrease_factor;
+        orientation_params.damping_increase_factor = ik_tuning_.damping_increase_factor;
+        orientation_params.trust_region_good_ratio = ik_tuning_.trust_region_good_ratio;
+        orientation_params.trust_region_acceptable_ratio =
+          ik_tuning_.trust_region_acceptable_ratio;
+
+        const ik::IkStepResult orientation_result = ik::orientationAlignStep(
+          robot_model_, ik::eeXAxisUpAlignment, /*target_score=*/1.0, q_,
+          place_release_orientation_damping_, orientation_params);
+        q_ = orientation_result.q;
+        place_release_orientation_damping_ = orientation_result.damping;
+
+        if (orientation_result.converged ||
+          place_release_orientation_damping_ >= ik_tuning_.max_damping)
+        {
+          place_release_orientation_aligned_ = true;
+        }
       }
 
       // 여기도 COMPLETE_GRIP z+lift 대기에서 쓰던 것과 같은 느슨한 임계값을 재사용함
       // (complete_grip_settle_* - 이름은 COMPLETE_GRIP 전용처럼 보이지만 실제로는
       // "이 두 군데의 settle 대기 전용 느슨한 값"이라는 뜻으로 같이 씀, 대화 참고).
-      if (
-        isSettled(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]],
-          ik_tuning_.complete_grip_settle_velocity_threshold,
-          ik_tuning_.complete_grip_settle_position_tolerance_rad) &&
-        isSettled(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]],
-          ik_tuning_.complete_grip_settle_velocity_threshold,
-          ik_tuning_.complete_grip_settle_position_tolerance_rad))
+      // orientation 정렬 자체가 아직 안 끝났으면(위 래치가 아직 false) 당연히 이
+      // settle 확인도 통과 못 함(q_가 매 tick 계속 움직이는 중이라서).
+      if (place_release_orientation_aligned_ && allSettled({
+          {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
+          {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
+          {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
+          {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
+        }, ik_tuning_.complete_grip_settle_velocity_threshold,
+        ik_tuning_.complete_grip_settle_position_tolerance_rad))
       {
-        // 어깨/팔꿈치가 다 settle된 뒤 - 그리퍼 오픈 명령.
+        // orientation이 다 정렬/settle된 뒤 - 그리퍼 오픈 명령.
         gripper_position_ = ik_tuning_.place_gripper_open_rad;
 
         // 그리퍼가 실제로 open 위치까지 도달한 뒤에야 - 혹시 공이 그리퍼에

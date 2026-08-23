@@ -93,12 +93,15 @@ Eigen::VectorXd jointLimitAvoidanceDq(const RobotModel& rm, const Eigen::VectorX
 // 필요한 외부 호출부가 재사용하도록 뺌.
 Eigen::Vector3d eePosition(RobotModel& rm, const Eigen::VectorXd& q);
 
-// ee_link_1의 로컬 Z축(그리퍼가 물건을 향해 뻗는 축)이 world -Z(바로 아래 방향)와 얼마나
-// 정렬됐는지를 나타내는 스칼라. -1이면 완벽히 아래를 향함(이상적인 top-down 그립),
-// +1이면 완벽히 위를 향함(정반대).
+// ee_link_1의 로컬 Z축(그리퍼가 물건을 향해 뻗는 축)이 world +Z(수직 위)와 얼마나
+// 정렬됐는지를 나타내는 스칼라. +1이면 완벽히 정렬(PICK의 top-down 그립에 맞는 방향 -
+// ee_link_1 프레임 자체의 로컬 Z축 정의가 "물건 쪽"이 아니라 반대쪽을 향해있어서,
+// world +Z 쪽으로 당겨야 실제로는 그리퍼가 아래를 보게 됨. 대화로 확인함), -1이면
+// 정반대. 함수 이름은 "물리적으로 아래를 향하게 한다"는 의미로 그대로 둠 - dot 타겟은
+// world +Z지만 결과적으로 하는 일은 여전히 top-down 정렬.
 double eeDownAlignment(RobotModel& rm, const Eigen::VectorXd& q);
 
-// torso_yaw + 왼팔 3관절에 대해, eeDownAlignment(q)를 -1(완전히 아래)에 최대한 가깝게
+// torso_yaw + 왼팔 3관절에 대해, eeDownAlignment(q)를 +1(완전히 정렬)에 최대한 가깝게
 // 만드는 방향으로 당기는 dq를 유한차분으로 근사해서 반환(secondary_dq로 바로 사용 가능).
 // elbowTorsoAvoidanceDq(collision_model.hpp)와 동일한 유한차분 패턴이지만, threshold로
 // 게이팅하지 않고 항상 당김(정렬은 "가까워지면"이 아니라 "항상 최대한" 원하는 목표라서).
@@ -106,12 +109,45 @@ double eeDownAlignment(RobotModel& rm, const Eigen::VectorXd& q);
 Eigen::VectorXd eeOrientationAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q,
                                           double k_pull = 1.0, double eps = 1e-4);
 
+// ee_link_1의 로컬 X축(그리퍼를 놓을 때 세우는 축)이 world +Z(수직 위)와 얼마나
+// 정렬됐는지를 나타내는 스칼라. +1이면 완벽히 정렬(로컬 X가 그대로 위를 향함),
+// -1이면 정반대. VIRTUAL_PLACE 그리퍼 오픈 시퀀스가 "놓는 자세"를 잡을 때 씀
+// (fsm.cpp stepPlaceIk 참고) - eeDownAlignment(PICK의 top-down 그립용)와는 축/타겟
+// 둘 다 달라서 별도 함수로 둠.
+double eeXAxisUpAlignment(RobotModel& rm, const Eigen::VectorXd& q);
+
+// torso_yaw + 왼팔 3관절에 대해, eeXAxisUpAlignment(q)를 +1(완전히 정렬)에 최대한
+// 가깝게 만드는 방향으로 당기는 dq를 유한차분으로 근사해서 반환(eeOrientationAlignmentDq와
+// 동일한 유한차분 패턴, 타겟만 +1). [현재 미사용 - jointLimitAvoidanceDq와 동일하게
+// 포팅만 해두고 비활성 상태. stepPlaceIk는 매 tick 이 dq를 고정 크기로 그냥 더하는
+// 대신 orientationAlignStep(damped least squares + trust-region)을 씀 - 고정 스텝
+// 방식은 threshold를 못 넘는 자세에서 계속 진동하는 문제가 있었음(대화 참고)].
+Eigen::VectorXd eeXAxisUpAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q,
+                                      double k_pull = 1.0, double eps = 1e-4);
+
 // torso + 왼팔(오른팔은 항상 고정, kRightArmIndices)을 사용해서 한 스텝 진행. 도달 가능한
 // 거리에서 사용(scripts/lib/ik_solver.py의 ik_step()에 대응). 도달 불가능 모드 전용이었던
 // ik_step_arm_only는 포팅하지 않음 — 그 기능은 곧 허리 고정 회전 방식으로 완전히 대체될 예정.
 IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eigen::VectorXd& q,
                      double damping, const IkStepParams& params,
                      const CollisionCheckFn& collision_checker = nullptr);
+
+// eeDownAlignment/eeXAxisUpAlignment처럼 (RobotModel&, q) -> 스칼라 정렬 스코어를 돌려주는
+// 함수. orientationAlignStep이 이 타입으로 어떤 정렬 스코어든 받아서 풂.
+using AlignmentScoreFn = std::function<double(RobotModel&, const Eigen::VectorXd&)>;
+
+// alignment_fn(q)이 target_score에 도달하도록 torso_yaw + 왼팔 3관절만으로 한 스텝
+// 진행. ikStep과 완전히 같은 구조(damped least squares + trust-region accept/reject)를
+// 3D 위치 대신 1D 스칼라 정렬 오차에 적용한 버전 - VIRTUAL_PLACE 그리퍼 오픈 시퀀스의
+// "놓는 자세" 정렬(eeXAxisUpAlignment)에 씀(fsm.cpp stepPlaceIk 참고). 이전엔
+// eeXAxisUpAlignmentDq로 계산한 dq를 매 tick 고정 크기로 그냥 더하기만 했는데, 그
+// 방식은 threshold를 물리적으로 못 넘는 자세에서 dq가 계속 더해지며 진동했음(대화
+// 참고) - damping이 rho(선형근사 신뢰도)를 보고 스텝 크기를 자동으로 줄여서, 못
+// 넘는 상황이면 damping이 상한까지 올라가며 자연히(진동 없이) 멈추게 함.
+IkStepResult orientationAlignStep(RobotModel& rm, const AlignmentScoreFn& alignment_fn,
+                                   double target_score, const Eigen::VectorXd& q,
+                                   double damping, const IkStepParams& params,
+                                   const CollisionCheckFn& collision_checker = nullptr);
 
 namespace detail {
 // min ||A x - b||^2 s.t. lb <= x <= ub 를 active-set으로 품(box 제약만 지원, n<=8 정도의

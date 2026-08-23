@@ -89,7 +89,7 @@ manipulation_node_cpp:
     place.apex_x: 0.1
     place.apex_y: 0.2
     # 시작->정점->목표 전체 궤적 재생 시간(초).
-    place.traj_duration_sec: 5.0
+    place.traj_duration_sec: 6.0
 
     # VIRTUAL_PLACE place_tol_ 유동 조정 폭(m, runDampedIkTick/stepPlaceIk 참고) - rho/
     # damping으로 "진짜 스텝을 밟았는지"부터 걸러낸 뒤에만 스트릭을 세므로(fsm.hpp
@@ -114,7 +114,12 @@ manipulation_node_cpp:
     # pick.complete_grip_settle_*(0.6rad)로는 너무 느슨해서 실제로 kick/restore가
     # 거의 안 된 상태에서도 settle로 오판할 수 있어 훨씬 타이트하게 따로 둠.
     place.release_torso_settle_velocity_threshold: 0.1
-    place.release_torso_settle_position_tolerance_rad: 0.05
+    place.release_torso_settle_position_tolerance_rad: 0.1
+
+    # 그리퍼 오픈 시퀀스가 "놓는 자세"로 수렴시킬 때 씀(fsm.hpp
+    # place_release_orientation_align_threshold 필드 주석 참고) - gripper 로컬 +X축을
+    # world +Z에 정렬(torso_yaw+왼팔 3관절, ik::orientationAlignStep).
+    place.release_orientation_align_threshold: 0.95
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.
@@ -140,8 +145,9 @@ manipulation_node_cpp:
     # 1)과 견줄 만큼 방향 정렬도 중요하게 다루려고 크게 잡음(실기에서 더 튜닝 필요).
     ik.secondary_gain: 1.0
 
-    # 그리퍼가 물건을 위에서(top-down) 잡도록, ee_link_1 로컬 Z축을 world 아래
-    # 방향(-Z)에 정렬시키는 gradient pull 세기.
+    # 그리퍼가 물건을 위에서(top-down) 잡도록, ee_link_1 로컬 Z축을 world 위
+    # 방향(+Z)에 정렬시키는 gradient pull 세기(ik_solver.hpp eeDownAlignment 필드
+    # 주석 참고 - 프레임 정의상 +Z로 당겨야 실제로 아래를 보게 됨).
     ik.orientation_align_k_pull: 1.0
 
     # (현재 미사용 - elbowTorsoAvoidanceDq 호출 안 함) left_elbow_1-torso_1 메쉬
@@ -208,11 +214,3 @@ manipulation_node_cpp:
     # VIRTUAL_PLACE에서 물건을 놓을 때 벌리는 각도(도) - gripper.open_deg(PICK_READY
     # 진입용)와 별개. 확실히 떨어뜨리려면 더 크게 벌려야 할 수 있어서 넉넉하게 잡음.
     gripper.place_open_deg: 65.0
-    # VIRTUAL_PLACE에서 그리퍼를 벌릴 때 left_shoulder_pitch도 그 순간 실측값 기준으로
-    # 이만큼(도) 같이 돌림 - 그리퍼 모터와 연결된 프레임이 놓는 자세에서 그리퍼
-    # 아래쪽으로 가버려서 모터만 돌고 실제로는 안 놓아지는 문제 대응.
-    gripper.place_release_shoulder_pitch_offset_deg: 25.0
-    # 위와 같은 시점(그리퍼 벌릴 때 딱 한 번)에 elbow_pitch도 그 순간 실측값 기준으로
-    # 이만큼(도) 같이 돌림 - shoulder_pitch만으로 부족할 때 팔꿈치까지 보태서 프레임을
-    # 확실히 빼냄.
-    gripper.place_release_elbow_offset_deg: -20.0

@@ -144,7 +144,7 @@ double eeDownAlignment(RobotModel& rm, const Eigen::VectorXd& q) {
   pinocchio::updateFramePlacements(rm.model(), rm.data());
   // 회전행렬의 3번째 열이 로컬 Z축을 world 좌표로 표현한 벡터(R * [0,0,1]^T = R.col(2)).
   const Eigen::Vector3d local_z_in_world = rm.data().oMf[rm.eeId()].rotation().col(2);
-  return local_z_in_world.dot(Eigen::Vector3d(0.0, 0.0, -1.0));
+  return local_z_in_world.dot(Eigen::Vector3d(0.0, 0.0, 1.0));
 }
 
 Eigen::VectorXd eeOrientationAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q, double k_pull,
@@ -160,9 +160,37 @@ Eigen::VectorXd eeOrientationAlignmentDq(RobotModel& rm, const Eigen::VectorXd& 
     q_pert[idx] += eps;
     const double s_pert = eeDownAlignment(rm, q_pert);
     const double grad = (s_pert - s0) / eps;
-    // (s - (-1))^2 = (s+1)^2를 최소화하는 gradient descent 방향
+    // (s - 1)^2를 최소화하는 gradient descent 방향
     // (elbowTorsoAvoidanceDq의 (threshold-d0)^2 최소화와 동일한 형태).
-    dq[idx] = -k_pull * 2.0 * (s0 + 1.0) * grad;
+    dq[idx] = -k_pull * 2.0 * (s0 - 1.0) * grad;
+  }
+  return dq;
+}
+
+double eeXAxisUpAlignment(RobotModel& rm, const Eigen::VectorXd& q) {
+  pinocchio::forwardKinematics(rm.model(), rm.data(), q);
+  pinocchio::updateFramePlacements(rm.model(), rm.data());
+  // 회전행렬의 1번째 열이 로컬 X축을 world 좌표로 표현한 벡터(R * [1,0,0]^T = R.col(0)).
+  const Eigen::Vector3d local_x_in_world = rm.data().oMf[rm.eeId()].rotation().col(0);
+  return local_x_in_world.dot(Eigen::Vector3d(0.0, 0.0, 1.0));
+}
+
+Eigen::VectorXd eeXAxisUpAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q, double k_pull,
+                                      double eps) {
+  const double s0 = eeXAxisUpAlignment(rm, q);
+  Eigen::VectorXd dq = Eigen::VectorXd::Zero(rm.model().nq);
+
+  std::vector<int> indices = {kTorsoJointIndex};
+  for (int idx : kLeftArmIndices) indices.push_back(idx);
+
+  for (int idx : indices) {
+    Eigen::VectorXd q_pert = q;
+    q_pert[idx] += eps;
+    const double s_pert = eeXAxisUpAlignment(rm, q_pert);
+    const double grad = (s_pert - s0) / eps;
+    // (s - 1)^2를 최소화하는 gradient descent 방향(eeOrientationAlignmentDq와 동일한
+    // 형태, 타겟만 -1 대신 +1).
+    dq[idx] = -k_pull * 2.0 * (s0 - 1.0) * grad;
   }
   return dq;
 }
@@ -258,6 +286,104 @@ IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eig
   const double predicted_reduction =
       error_norm * error_norm - (jacobian_pos * dq - error).squaredNorm();
   const double actual_reduction = error_norm * error_norm - candidate_error_norm * candidate_error_norm;
+  const double rho = predicted_reduction < 1e-12 ? -1.0 : actual_reduction / predicted_reduction;
+
+  if (rho > params.trust_region_good_ratio) {
+    result.q = q_candidate;
+    result.converged = false;
+    result.damping = std::max(params.min_damping, damping * params.damping_decrease_factor);
+    result.hard_rejected = false;
+    return result;
+  }
+
+  if (rho > params.trust_region_acceptable_ratio) {
+    result.q = q_candidate;
+    result.converged = false;
+    result.damping = damping;
+    result.hard_rejected = false;
+    return result;
+  }
+
+  result.q = q;
+  result.converged = false;
+  result.damping = std::min(params.max_damping, damping * params.damping_increase_factor);
+  result.hard_rejected = false;
+  return result;
+}
+
+IkStepResult orientationAlignStep(RobotModel& rm, const AlignmentScoreFn& alignment_fn,
+                                   double target_score, const Eigen::VectorXd& q,
+                                   double damping, const IkStepParams& params,
+                                   const CollisionCheckFn& collision_checker) {
+  const pinocchio::Model& model = rm.model();
+  const int nq = model.nq;
+
+  const double s0 = alignment_fn(rm, q);
+  const double error = target_score - s0;
+
+  IkStepResult result;
+  if (std::abs(error) < params.tol) {
+    result.q = q;
+    result.converged = true;
+    result.damping = damping;
+    result.hard_rejected = false;
+    return result;
+  }
+
+  // torso_yaw + 왼팔 3관절만 활성 - eeXAxisUpAlignmentDq/eeOrientationAlignmentDq와
+  // 동일한 유한차분으로 스칼라 gradient(1 x n_active)를 근사.
+  std::vector<int> indices = {kTorsoJointIndex};
+  for (int idx : kLeftArmIndices) indices.push_back(idx);
+  const int n_active = static_cast<int>(indices.size());
+  constexpr double eps = 1e-4;
+
+  Eigen::RowVectorXd grad(n_active);
+  for (int i = 0; i < n_active; ++i) {
+    Eigen::VectorXd q_pert = q;
+    q_pert[indices[i]] += eps;
+    grad[i] = (alignment_fn(rm, q_pert) - s0) / eps;
+  }
+
+  // damped least squares: [grad; damping*I] dq_active = [error; 0] - ikStep의
+  // A_primary/b_primary와 동일한 구성(joint_weight_scale 정규화는 여기선 생략, 4
+  // DOF뿐이라 위치 IK만큼 정규화가 절실하지 않음).
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(1 + n_active, n_active);
+  A.row(0) = grad;
+  A.bottomRows(n_active) = damping * Eigen::MatrixXd::Identity(n_active, n_active);
+  Eigen::VectorXd b = Eigen::VectorXd::Zero(1 + n_active);
+  b[0] = error;
+
+  Eigen::VectorXd lb(n_active);
+  Eigen::VectorXd ub(n_active);
+  for (int i = 0; i < n_active; ++i) {
+    lb[i] = model.lowerPositionLimit[indices[i]] - q[indices[i]];
+    ub[i] = model.upperPositionLimit[indices[i]] - q[indices[i]];
+  }
+
+  const Eigen::VectorXd dq_active = detail::solveBoundedLsq(A, b, lb, ub);
+  const Eigen::VectorXd dq_active_scaled = params.alpha * dq_active;
+
+  Eigen::VectorXd dq = Eigen::VectorXd::Zero(nq);
+  for (int i = 0; i < n_active; ++i) dq[indices[i]] = dq_active_scaled[i];
+
+  Eigen::VectorXd q_candidate(nq);
+  pinocchio::integrate(model, q, dq, q_candidate);
+
+  if (collision_checker && collision_checker(q_candidate)) {
+    result.q = q;
+    result.converged = false;
+    result.damping = std::min(params.max_damping, damping * params.damping_increase_factor);
+    result.hard_rejected = true;
+    return result;
+  }
+
+  const double candidate_score = alignment_fn(rm, q_candidate);
+  const double candidate_error = target_score - candidate_score;
+
+  const double predicted_delta = grad * dq_active_scaled;
+  const double predicted_reduction =
+      error * error - (predicted_delta - error) * (predicted_delta - error);
+  const double actual_reduction = error * error - candidate_error * candidate_error;
   const double rho = predicted_reduction < 1e-12 ? -1.0 : actual_reduction / predicted_reduction;
 
   if (rho > params.trust_region_good_ratio) {

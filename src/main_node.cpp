@@ -248,14 +248,6 @@ private:
     // (PICK_READY 진입용)보다 더 크게 벌려야 할 수 있어서 따로 뺌.
     const double place_gripper_open_deg =
       declare_parameter<double>("gripper.place_open_deg", 60.0);
-    // place_release_shoulder_pitch_offset_rad 필드 주석 참고 - 놓을 때 그리퍼 모터
-    // 프레임이 아래로 가버리는 문제 대응용 어깨 pitch 추가 회전(도).
-    const double place_release_shoulder_pitch_offset_deg = declare_parameter<double>(
-      "gripper.place_release_shoulder_pitch_offset_deg", -50.0);
-    // place_release_elbow_offset_rad 필드 주석 참고 - 같은 시점에 같이 도는 팔꿈치
-    // 추가 회전(도).
-    const double place_release_elbow_offset_deg =
-      declare_parameter<double>("gripper.place_release_elbow_offset_deg", 30.0);
     // place_release_torso_kick_rad 필드 주석 참고 - 그리퍼 오픈 시퀀스 마지막에
     // torso_yaw를 이 각도(도)만큼 kick했다가 원래 자리로 되돌림.
     const double place_release_torso_kick_deg =
@@ -263,14 +255,15 @@ private:
     tuning.gripper_open_rad = gripper_open_deg * M_PI / 180.0;
     tuning.gripper_closed_rad = gripper_closed_deg * M_PI / 180.0;
     tuning.place_gripper_open_rad = place_gripper_open_deg * M_PI / 180.0;
-    tuning.place_release_shoulder_pitch_offset_rad =
-      place_release_shoulder_pitch_offset_deg * M_PI / 180.0;
-    tuning.place_release_elbow_offset_rad = place_release_elbow_offset_deg * M_PI / 180.0;
     tuning.place_release_torso_kick_rad = place_release_torso_kick_deg * M_PI / 180.0;
     tuning.place_release_torso_settle_velocity_threshold =
       declare_parameter<double>("place.release_torso_settle_velocity_threshold", 0.1);
     tuning.place_release_torso_settle_position_tolerance_rad =
       declare_parameter<double>("place.release_torso_settle_position_tolerance_rad", 0.05);
+    // place_release_orientation_align_threshold 필드 주석 참고 - 그리퍼 오픈 시퀀스가
+    // "놓는 자세"(로컬 +X축을 world +Z에 정렬)로 수렴시킬 때 씀.
+    tuning.place_release_orientation_align_threshold =
+      declare_parameter<double>("place.release_orientation_align_threshold", 0.95);
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.
