@@ -36,6 +36,12 @@ manipulation_node_cpp:
     grip.wiggle_kick_settle_velocity_threshold: 0.1
     grip.wiggle_kick_settle_position_tolerance_rad: 0.08
 
+    # 그립 위글 restore(다시 오므리는) 단계가 gripper_closed_rad까지 도달했는지 확인할
+    # 전용 settle 임계값 - 물체를 물고 있으면 완전히 닫히는 자리까지 못 갈 수 있어서
+    # 공용 settle_*보다도 더 느슨하게 따로 둠(grip.wiggle_kick_settle_*와 반대 방향).
+    grip.wiggle_restore_settle_velocity_threshold: 0.5
+    grip.wiggle_restore_settle_position_tolerance_rad: 0.5
+
     # --- 아래는 구 ik_solve_node.yaml에서 병합됨(ik_solve_node.py가 fsm.cpp로
     # 흡수되면서 별도 프로세스/yaml이 없어짐). 값은 debug_ik_node.yaml에서 이번
     # 세션에 실측으로 튜닝된 값과 동일하게 맞춤(같은 로봇이므로).
@@ -102,7 +108,7 @@ manipulation_node_cpp:
     # 그리퍼 오픈 시퀀스 마지막에 torso_yaw를 이 각도(도)만큼 kick했다가 원래 자리로
     # 되돌림 - 혹시 공이 그리퍼에 걸려있으면 확실히 떨어뜨리기 위함(fsm.hpp
     # place_release_torso_kick_rad 필드 주석 참고).
-    place.release_torso_kick_deg: 10.0
+    place.release_torso_kick_deg: 30.0
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.

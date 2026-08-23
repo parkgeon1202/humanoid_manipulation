@@ -150,7 +150,10 @@ void ManipulationFSM::reset()
   place_tol_fail_streak_ = 0;
   place_release_shoulder_pitch_commanded_ = false;
   place_release_elbow_commanded_ = false;
-  place_release_error_confirmed_ok_ = false;
+  place_release_arm_settled_confirmed_ = false;
+  place_release_torso_kicked_ = false;
+  place_release_torso_restore_commanded_ = false;
+  place_release_torso_base_rad_ = 0.0;
   kick_settling_ = false;
   gripper_position_ = ik_tuning_.gripper_open_rad;
 
@@ -612,11 +615,12 @@ void ManipulationFSM::onMotorFeedbackImpl()
       }
     } else {
       ++grip_wiggle_restore_wait_ticks_;
-      // 그리퍼가 물체를 물어서 gripper_closed_rad까지 실측이 못 좁혀지면 isSettled가
-      // 영영 안 될 수 있어서, grip_wiggle_restore_timeout_ticks 틱이 지나면 settle
-      // 여부와 무관하게 강제로 넘어감(무한 대기 방지).
-      if (isSettled(kGripMotorId, ik_tuning_.gripper_closed_rad) ||
-        grip_wiggle_restore_wait_ticks_ > ik_tuning_.grip_wiggle_restore_timeout_ticks)
+      // 그리퍼가 물체를 물어서 gripper_closed_rad까지 완전히 못 좁혀지는 경우가
+      // 있어서, 이 확인은 grip_wiggle_restore_settle_*로 공용 settle_*보다도 더
+      // 느슨하게 봄(필드 주석 참고).
+      if (isSettled(kGripMotorId, ik_tuning_.gripper_closed_rad,
+          ik_tuning_.grip_wiggle_restore_settle_velocity_threshold,
+          ik_tuning_.grip_wiggle_restore_settle_position_tolerance_rad))
       {
         //이제 그리퍼가 실제로 다시 오므려진 걸 확인함(또는 타임아웃으로 강제 진행)
         pending_grip_wiggle_ = false;
@@ -803,7 +807,7 @@ void ManipulationFSM::solveTickImpl()
       place_tol_fail_streak_ = 0;
       place_release_shoulder_pitch_commanded_ = false;
       place_release_elbow_commanded_ = false;
-      place_release_error_confirmed_ok_ = false;
+      place_release_arm_settled_confirmed_ = false;
       place_release_torso_kicked_ = false;
       place_release_torso_restore_commanded_ = false;
       kick_settling_ = false;
@@ -1420,7 +1424,7 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       } else if (result->hard_rejected || (real_step && damping_ > damping_before)) {
         place_tol_success_streak_ = 0;
         if (++place_tol_fail_streak_ >= kPlaceTolAdjustStreakTicks) {
-          place_tol_ = std::min(kPlaceTolMaxM, place_tol_ + ik_tuning_.place_tol_increase_step_m);
+          place_tol_ = std::min(kPlaceTolMaxM, place_tol_+0.2 + ik_tuning_.place_tol_increase_step_m);
           place_tol_fail_streak_ = 0;
         }
       }
@@ -1433,14 +1437,14 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       // damping이 상한까지 올라갔다는 건 트러스트 리전이 계속 스텝을 반려해서 더는
       // 못 나아간다는 뜻(stepPickIk의 pick_stall_debug와 동일 진단, 대화 참고) - 이
       // 상태로 계속 기다려봐야 더 좁혀지지 않으니 "여기가 한계"로 보고 바로 수렴
-      // 처리해서 opening_gripper 쪽 그리퍼 오픈 시퀀스(place_release_error_confirmed_ok_
-      // 래치도 같이)로 넘어가게 함 - Cartesian 재검사(real_error) 없이 바로 감.
+      // 처리해서 opening_gripper 쪽 그리퍼 오픈 시퀀스로 넘어가게 함. 실측 팔이 진짜
+      // 도달했는지는 그쪽의 allSettled(place_release_arm_settled_confirmed_ 래치)가
+      // 여전히 확인하므로, 여기서 그 확인 자체를 건너뛰는 건 아님.
       if (damping_ >= ik_tuning_.max_damping) {
         std::printf(
           "[place_damping_maxed] damping=%.4f >= max=%.4f - treating as converged\n",
           damping_, ik_tuning_.max_damping);
         ik_converged_ = true;
-        place_release_error_confirmed_ok_ = true;
       }
 
       if (result->converged) {
@@ -1469,8 +1473,12 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
     // 문제가 있었음(VIRTUAL_PLACE 전용 - opening_gripper=true인 호출부가 여기뿐).
     // 그리퍼를 열기 전에 실측 피드백으로 진짜 도달을 먼저 확인함. 여기도 다른 곳
     // (advance() 게이트, COMPLETE_GRIP z+lift 대기)과 같은 느슨한 임계값을 재사용함
-    // (complete_grip_settle_* - 대화 참고).
-    if (!allSettled({
+    // (complete_grip_settle_* - 대화 참고). 한 번이라도 확인되면 그 뒤로는 재검사
+    // 없이 래치 유지 - 아래 오픈 시퀀스(어깨/팔꿈치 오프셋)가 일부러 EE를
+    // target_pos_에서 떨어뜨리는 동작이라, 매 tick 재검사하면 그 뒤로 실측이 다시
+    // allSettled 기준을 벗어나서 이 대기 분기로 계속 되돌아오는 문제가 있었음
+    // (대화 참고 - 그리퍼 여는 동안 팔이 흔들리던 원인).
+    if (!place_release_arm_settled_confirmed_ && !allSettled({
         {kTorsoMotorId, q_[ik::kTorsoJointIndex]},
         {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
         {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
@@ -1481,102 +1489,65 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       // 아직 실측이 IK 목표에 도달 전 - 그리퍼는 계속 닫힌 채(gripper_position_
       // 유지) 조용히 대기.
     } else {
-      // allSettled는 "실측 모터가 q_에 도달했는가"(joint space)만 볼 뿐, 그 q_ 자체가
-      // target_pos_ 근처인지(Cartesian)는 안 봄 - place_tol_이 느슨한 채로 ik_converged_가
-      // 됐으면 q_가 target_pos_에서 최대 place_tol_(상한 kPlaceTolMaxM=10cm)만큼 떨어진
-      // 채로 여기 올 수 있음. place_release_error_confirmed_ok_가 아직 안 래치됐으면
-      // 실측 관절값으로 다시 FK를 잡아 독립적으로 재확인해서, 벗어나 있으면 그리퍼를
-      // 열지 않고 ik_converged_를 다시 풀어서 재수렴시킴(계속 IK는 풀리게 둠).
-      // 한 번이라도 이내로 확인되면 그 뒤로는 재검사 없이 래치 유지 - 아래 그리퍼
-      // 오픈 시퀀스(어깨/팔꿈치 오프셋)가 일부러 EE를 target_pos_에서 떨어뜨리는
-      // 동작이라, 매 tick 재검사하면 오프셋 적용 후 real_error가 다시 max를 넘어서
-      // 이 가드가 q_를 되돌려버리는 충돌이 있었음(대화 참고 - 그리퍼 여는 동안 팔이
-      // 흔들리던 원인. place_release_max_error_m/place_release_error_confirmed_ok_
-      // 필드 주석 참고).
-      if (!place_release_error_confirmed_ok_) {
-        Eigen::VectorXd q_real = q_;
-        q_real[ik::kTorsoJointIndex] = motor_position(kTorsoMotorId);
-        q_real[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId);
-        q_real[ik::kLeftArmIndices[1]] = motor_position(kLeftShoulderRollMotorId);
-        q_real[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId);
-        const double real_error = (target_pos_ - ik::eePosition(robot_model_, q_real)).norm();
-        if (real_error > ik_tuning_.place_release_max_error_m) {
-          std::printf(
-            "[place_release_guard] blocked: real_error=%.4f > max=%.4f - re-solving from real q\n",
-            real_error, ik_tuning_.place_release_max_error_m);
-          // ik_converged_만 풀고 q_는 그대로 두면, q_ 기준으로는 이미 target_pos_에서
-          // place_tol_ 이내(그러니까 애초에 converged=true였던 것)라 다음 tick ikStep이
-          // error_norm을 다시 재보자마자 또 즉시 "수렴함"으로 판정해버려서 q_가 전혀
-          // 안 바뀐 채로 이 분기에 영원히 되돌아옴(실측으로 확인됨 - real_error가 매
-          // tick 똑같은 값으로 안 줄어듦). q_를 실측 위치로 스냅해야 다음 ikStep이
-          // "진짜 지금 어디 있는지" 기준으로 다시 계산해서 실제 보정 스텝을 밟음.
-          q_ = q_real;
-          ik_converged_ = false;
-        }
-        place_release_error_confirmed_ok_ = real_error <= ik_tuning_.place_release_max_error_m;
+      place_release_arm_settled_confirmed_ = true;
+
+      // place_gripper_open_rad 필드 주석 참고 - PICK_READY 진입용 gripper_open_rad와
+      // 별개 값(놓을 때 확실히 떨어뜨리려고 더 크게 벌릴 수 있음). 실제 명령은 아래
+      // 어깨/팔꿈치 오프셋까지 settle된 뒤에 나감.
+      // place_release_shoulder_pitch_commanded_ 필드 주석 참고 - 그리퍼 모터와 연결된
+      // 프레임이 놓는 자세에서 그리퍼 아래쪽으로 가버려서 모터만 돌고 실제로는 안
+      // 놓아지는 문제 대응. 이 분기에 처음 들어온 tick에만(딱 한 번) 그 순간 실측
+      // left_shoulder_pitch + offset을 q_에 바로 대입해서 고정 - 매 tick 다시 읽으면
+      // 목표 자체가 계속 움직여서 isSettled가 영영 안 됨(IK는 이미 안 도니 그 뒤로
+      // q_가 다른 데서 안 바뀜 - 아래 set_motor_goal_position이 그대로 이 값을 씀).
+      if (!place_release_shoulder_pitch_commanded_) {
+        q_[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId) +
+          ik_tuning_.place_release_shoulder_pitch_offset_rad;
+        place_release_shoulder_pitch_commanded_ = true;
+      }
+      // shoulder_pitch만으로 안 빠지는 경우 대비 - 동일 패턴(딱 한 번, 실측값 +
+      // offset)으로 elbow_pitch도 같이 돌림(place_release_elbow_offset_rad 필드 주석 참고).
+      if (!place_release_elbow_commanded_) {
+        q_[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId) +
+          ik_tuning_.place_release_elbow_offset_rad;
+        place_release_elbow_commanded_ = true;
       }
 
-      if (place_release_error_confirmed_ok_) {
-        // 매 tick 목표를 조금씩(step) 당기지 않고 열림 목표를 한 번에 그대로 명령함 -
-        // 실제 이동 속도/궤적은 모터 자체의 profile_velocity가 담당. 완료 판정은
-        // 소프트웨어 setpoint가 아니라 실제 모터 피드백(isSettled)으로 함.
-        // place_gripper_open_rad 필드 주석 참고 - PICK_READY 진입용 gripper_open_rad와
-        // 별개 값(놓을 때 확실히 떨어뜨리려고 더 크게 벌릴 수 있음).
+      // 여기도 COMPLETE_GRIP z+lift 대기에서 쓰던 것과 같은 느슨한 임계값을 재사용함
+      // (complete_grip_settle_* - 이름은 COMPLETE_GRIP 전용처럼 보이지만 실제로는
+      // "이 두 군데의 settle 대기 전용 느슨한 값"이라는 뜻으로 같이 씀, 대화 참고).
+      if (
+        isSettled(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]],
+          ik_tuning_.complete_grip_settle_velocity_threshold,
+          ik_tuning_.complete_grip_settle_position_tolerance_rad) &&
+        isSettled(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]],
+          ik_tuning_.complete_grip_settle_velocity_threshold,
+          ik_tuning_.complete_grip_settle_position_tolerance_rad))
+      {
+        // 그리퍼/어깨/팔꿈치가 다 settle된 뒤 - 혹시 공이 그리퍼에 걸려있으면
+        // 확실히 떨어뜨리려고 torso_yaw를 한 번 kick했다가 원래 자리로 되돌림
+        // (그립 위글과 동일한 command-once + settle-poll 패턴). 갈 때/올 때
+        // 둘 다 실측 settle을 확인한 뒤에야 다음 단계로 넘어감.
         gripper_position_ = ik_tuning_.place_gripper_open_rad;
-        // place_release_shoulder_pitch_commanded_ 필드 주석 참고 - 그리퍼 모터와 연결된
-        // 프레임이 놓는 자세에서 그리퍼 아래쪽으로 가버려서 모터만 돌고 실제로는 안
-        // 놓아지는 문제 대응. 이 분기에 처음 들어온 tick에만(딱 한 번) 그 순간 실측
-        // left_shoulder_pitch + offset을 q_에 바로 대입해서 고정 - 매 tick 다시 읽으면
-        // 목표 자체가 계속 움직여서 isSettled가 영영 안 됨(IK는 이미 안 도니 그 뒤로
-        // q_가 다른 데서 안 바뀜 - 아래 set_motor_goal_position이 그대로 이 값을 씀).
-        if (!place_release_shoulder_pitch_commanded_) {
-          q_[ik::kLeftArmIndices[0]] = motor_position(kLeftShoulderPitchMotorId) +
-            ik_tuning_.place_release_shoulder_pitch_offset_rad;
-          place_release_shoulder_pitch_commanded_ = true;
-        }
-        // shoulder_pitch만으로 안 빠지는 경우 대비 - 동일 패턴(딱 한 번, 실측값 +
-        // offset)으로 elbow_pitch도 같이 돌림(place_release_elbow_offset_rad 필드 주석 참고).
-        if (!place_release_elbow_commanded_) {
-          q_[ik::kLeftArmIndices[2]] = motor_position(kLeftElbowMotorId) +
-            ik_tuning_.place_release_elbow_offset_rad;
-          place_release_elbow_commanded_ = true;
-        }
-        // 여기도 COMPLETE_GRIP z+lift 대기에서 쓰던 것과 같은 느슨한 임계값을 재사용함
-        // (complete_grip_settle_* - 이름은 COMPLETE_GRIP 전용처럼 보이지만 실제로는
-        // "이 두 군데의 settle 대기 전용 느슨한 값"이라는 뜻으로 같이 씀, 대화 참고).
-        if (isSettled(kGripMotorId, ik_tuning_.place_gripper_open_rad,
-            ik_tuning_.complete_grip_settle_velocity_threshold,
-            ik_tuning_.complete_grip_settle_position_tolerance_rad) &&
-          isSettled(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]],
-            ik_tuning_.complete_grip_settle_velocity_threshold,
-            ik_tuning_.complete_grip_settle_position_tolerance_rad) &&
-          isSettled(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]],
-            ik_tuning_.complete_grip_settle_velocity_threshold,
-            ik_tuning_.complete_grip_settle_position_tolerance_rad))
-        {
-          // 그리퍼/어깨/팔꿈치가 다 settle된 뒤 - 혹시 공이 그리퍼에 걸려있으면
-          // 확실히 떨어뜨리려고 torso_yaw를 한 번 kick했다가 원래 자리로 되돌림
-          // (그립 위글과 동일한 command-once + settle-poll 패턴). 갈 때/올 때
-          // 둘 다 실측 settle을 확인한 뒤에야 다음 단계로 넘어감.
-          if (!place_release_torso_kicked_) {
-            place_release_torso_base_rad_ = q_[ik::kTorsoJointIndex];
-            q_[ik::kTorsoJointIndex] =
-              place_release_torso_base_rad_ + ik_tuning_.place_release_torso_kick_rad;
-            place_release_torso_kicked_ = true;
-          } else if (!place_release_torso_restore_commanded_) {
-            if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
-                ik_tuning_.complete_grip_settle_velocity_threshold,
-                ik_tuning_.complete_grip_settle_position_tolerance_rad))
-            {
-              q_[ik::kTorsoJointIndex] = place_release_torso_base_rad_;
-              place_release_torso_restore_commanded_ = true;
-            }
-          } else if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
+
+        if (!place_release_torso_kicked_) {
+          place_release_torso_base_rad_ = q_[ik::kTorsoJointIndex];
+          q_[ik::kTorsoJointIndex] =
+            place_release_torso_base_rad_ + ik_tuning_.place_release_torso_kick_rad;
+          place_release_torso_kicked_ = true;
+        } else if (!place_release_torso_restore_commanded_) {
+          if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
               ik_tuning_.complete_grip_settle_velocity_threshold,
               ik_tuning_.complete_grip_settle_position_tolerance_rad))
           {
-            advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
+            q_[ik::kTorsoJointIndex] = place_release_torso_base_rad_;
+            place_release_torso_restore_commanded_ = true;
           }
+        } else if (isSettled(kTorsoMotorId, q_[ik::kTorsoJointIndex],
+            ik_tuning_.complete_grip_settle_velocity_threshold,
+            ik_tuning_.complete_grip_settle_position_tolerance_rad))
+        {
+          advance();  // VIRTUAL_PLACE -> COMPLETE_PLACE
         }
       }
     }

@@ -175,6 +175,12 @@ struct IkTuning
   double grip_wiggle_kick_settle_velocity_threshold = 0.2;
   double grip_wiggle_kick_settle_position_tolerance_rad = 0.1;
 
+  // 그립 위글 restore(다시 오므리는) 단계가 gripper_closed_rad까지 도달했는지 확인할
+  // 전용 settle 임계값 - 물체를 물고 있으면 완전히 닫히는 자리까지 못 갈 수 있어서
+  // 공용 settle_*보다도 더 느슨하게 따로 둠(grip_wiggle_kick_settle_*와 반대 방향).
+  double grip_wiggle_restore_settle_velocity_threshold = 0.5;
+  double grip_wiggle_restore_settle_position_tolerance_rad = 0.5;
+
   // VIRTUAL_PLACE의 place_trajectory_ 재생 시간을 매 틱 얼마나 진행시킬지(ik.step_period_sec와
   // 동일 값을 넣어서 씀 - solve_tick 호출 주기와 궤적 재생 속도를 맞추기 위함).
   double place_traj_dt_sec = 0.02;
@@ -515,14 +521,13 @@ private:
   bool place_release_shoulder_pitch_commanded_ = false;
   // 위와 동일 이유(elbow_pitch 버전) - place_release_elbow_offset_rad 필드 주석 참고.
   bool place_release_elbow_commanded_ = false;
-  // 그리퍼를 열기 전 Cartesian 안전판(place_release_max_error_m 필드 주석,
-  // stepPlaceIk 참고)이 "한 번이라도" real_error <= place_release_max_error_m를
-  // 확인하면 true로 래치됨 - 그 뒤로는 매 tick 다시 검사 안 하고 그리퍼 오픈
-  // 시퀀스(어깨/팔꿈치 오프셋 포함)를 계속 진행함. 매 tick 계속 재검사하면, 그
-  // 오프셋 자체가 일부러 EE를 target_pos_에서 떨어뜨리는 동작이라 오프셋 적용 후
-  // real_error가 다시 max를 넘어서 이 가드가 q_를 되돌려버리는 충돌이 있었음
-  // (대화 참고 - 그리퍼 여는 동안 팔이 흔들리던 원인).
-  bool place_release_error_confirmed_ok_ = false;
+  // 그리퍼를 열기 전 실측 팔(joint space) settle 확인(stepPlaceIk의 allSettled
+  // 참고)이 한 번이라도 통과하면 true로 래치됨 - 그 뒤로는 매 tick 다시 검사 안 하고
+  // 그리퍼 오픈 시퀀스(어깨/팔꿈치 오프셋 포함)를 계속 진행함. 매 tick 계속
+  // 재검사하면, 그 오프셋 자체가 일부러 EE를 목표에서 떨어뜨리는 동작이라 오프셋
+  // 적용 후 실측이 다시 allSettled 기준을 벗어나서 이 가드가 계속 대기 분기로
+  // 되돌리는 충돌이 있었음(대화 참고 - 그리퍼 여는 동안 팔이 흔들리던 원인).
+  bool place_release_arm_settled_confirmed_ = false;
   // 그리퍼 오픈 시퀀스 마지막의 torso_yaw kick->restore(place_release_torso_kick_rad
   // 필드 주석 참고) 진행 상태 - kicked만 true면 kick 위치로 이동 중/settle 대기,
   // restore_commanded까지 true면 원래 자리(place_release_torso_base_rad_)로 복귀
