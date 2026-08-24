@@ -209,8 +209,9 @@ struct IkTuning
   // 상한(kPlaceTolMaxM, 10cm)보다 훨씬 타이트하게 잡아야 의미가 있음.
   double place_release_max_error_m = 0.02;
 
-  // 비전 y값의 실측 오프셋(m) - PICK_READY의 torso_yaw 편향 방향 결정 시
-  // target_pos_.y()에서 이 값을 뺀 보정값(corrected_y)을 씀(stepPickReady 참고).
+  // 비전 x/y값의 실측 오프셋(m). 캡처한 target_pos_에 x는 더하고
+  // y는 빼서 보정함(stepPickReady, stepPlaceIk 참고).
+  double vision_x_offset = 0.0;
   double vision_y_offset = 0.0328;
 
   // PICK 접근 궤적(pick_approach_trajectory_): PICK_READY -> PICK 전이 직전(q_ 4개가

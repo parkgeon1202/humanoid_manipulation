@@ -1197,6 +1197,7 @@ void ManipulationFSM::stepPickReady(bool state_changed)
         // 방향 결정은 물론, stepPickIk의 실제 IK 목표(target_pos_)에도
         // 그대로 반영됨.
         target_pos_.y() -= ik_tuning_.vision_y_offset;
+        target_pos_.x() -= ik_tuning_.vision_x_offset;
         std::printf(
           "[pick_ik_debug] captured target=(%.4f, %.4f, %.4f)\n",
           target_pos_.x(), target_pos_.y(), target_pos_.z());

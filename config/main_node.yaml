@@ -193,9 +193,10 @@ manipulation_node_cpp:
     ik.left_shoulder_roll_target_rad: 0.3
     ik.pick_ready_torso_bias_rad: 1.0
 
-    # 비전 y값의 실측 오프셋(m) - 비전을 캡처하는 순간(PICK_READY의 torso 편향
-    # 결정, VIRTUAL_PLACE의 IK 목표 둘 다) target_pos_.y()에서 이 값을 빼서 보정함.
-    ik.vision_y_offset: 0.0
+    # 비전 x/y값의 실측 오프셋(m) - 비전을 캡처하는 순간(PICK_READY와
+    # VIRTUAL_PLACE) target_pos_.x()에는 x 오프셋을 더하고 y에서는 y 오프셋을 뺌.
+    ik.vision_x_offset: -0.03
+    ik.vision_y_offset: 0.03
 
     # "모터가 목표에 도달했다"는 판정 전부(위 허리+어깨 회전은 물론, COMPLETE_PLACE에서
     # 팔을 0.0으로 홈잉할 때도) 이 두 값을 공유해서 씀 - 위치/속도 둘 다 만족해야

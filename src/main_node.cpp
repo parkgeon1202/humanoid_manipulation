@@ -293,6 +293,7 @@ private:
       declare_parameter<double>("ik.left_shoulder_roll_target_rad", 0.3);
     tuning.pick_ready_torso_bias_rad =
       declare_parameter<double>("ik.pick_ready_torso_bias_rad", 1.0);
+    tuning.vision_x_offset = declare_parameter<double>("ik.vision_x_offset", 0.0);
     tuning.vision_y_offset = declare_parameter<double>("ik.vision_y_offset", 0.0328);
     tuning.settle_velocity_threshold =
       declare_parameter<double>("ik.torso_settle_velocity_threshold", 0.3);
