@@ -46,7 +46,7 @@ constexpr double kPlaceTolInitialM = 0.003;
 constexpr int kPlaceTolAdjustStreakTicks = 10;
 // place_tol_이 아무리 계속 못 수렴해도 이 이상은 안 풀어줌(관절 한계 등으로 영영
 // 도달 불가능한 목표를 만나도 오차 허용치가 끝없이 커지는 걸 막는 안전판).
-constexpr double kPlaceTolMaxM = 1.0;
+constexpr double kPlaceTolMaxM = 0.3;
 }  // namespace
 
 ManipulationFSM::ManipulationFSM(const std::string & urdf_path, const std::string & ee_frame)
@@ -1429,7 +1429,7 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       } else if (result->hard_rejected || (real_step && damping_ > damping_before)) {
         place_tol_success_streak_ = 0;
         if (++place_tol_fail_streak_ >= kPlaceTolAdjustStreakTicks) {
-          place_tol_ = std::min(kPlaceTolMaxM, place_tol_+0.2 + ik_tuning_.place_tol_increase_step_m);
+          place_tol_ = std::min(kPlaceTolMaxM, place_tol_ + ik_tuning_.place_tol_increase_step_m);
           place_tol_fail_streak_ = 0;
         }
       }
@@ -1502,10 +1502,14 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       // 고정 offset을 한 번만 더하던 예전 방식, 그다음 고정 step gradient descent를
       // 매 tick 그냥 더하던 방식(대화 참고 - threshold를 못 넘는 자세에서 계속
       // 진동하는 문제가 있었음) 둘 다 대신, ikStep과 동일한 damped least squares +
-      // trust-region 구조(orientationAlignStep)로 gripper 로컬 +X축을 world +Z에
-      // 정렬시킴 - damping이 rho를 보고 스텝 크기를 자동 조절해서 못 넘는
-      // 상황에서도 damping이 상한까지 올라가며 진동 없이 멈춤(main IK 루프의
-      // damping_ >= max_damping 처리와 동일 패턴).
+      // trust-region 구조(orientationAlignStep)로 gripper orientation을 정렬시킴 -
+      // 로컬 X축->world +Z 제약 하나만으로는 orientation 3자유도 중 2개만 묶여서
+      // 그 축을 중심으로 한 회전(roll) 1자유도가 안 잡히고 임의로 남음(대화 참고 -
+      // "비스듬하게" 되던 원인). 로컬 Y축->world Y축 제약을 같이 걸어서 남은
+      // 자유도까지 마저 고정 - 두 제약을 동시에 만족하면 orientation 전체가 결정됨
+      // (look-at + up-vector와 동일한 아이디어). damping이 rho를 보고 스텝 크기를
+      // 자동 조절해서 못 넘는 상황에서도 damping이 상한까지 올라가며 진동 없이
+      // 멈춤(main IK 루프의 damping_ >= max_damping 처리와 동일 패턴).
       if (!place_release_orientation_aligned_) {
         ik::IkStepParams orientation_params;
         orientation_params.tol = 1.0 - ik_tuning_.place_release_orientation_align_threshold;
@@ -1519,8 +1523,12 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
           ik_tuning_.trust_region_acceptable_ratio;
 
         const ik::IkStepResult orientation_result = ik::orientationAlignStep(
-          robot_model_, ik::eeXAxisUpAlignment, /*target_score=*/1.0, q_,
-          place_release_orientation_damping_, orientation_params);
+          robot_model_,
+          {
+            {ik::eeXAxisUpAlignment, 1.0},
+            {ik::eeYAxisAlignment, 1.0},
+          },
+          q_, place_release_orientation_damping_, orientation_params);
         q_ = orientation_result.q;
         place_release_orientation_damping_ = orientation_result.damping;
 

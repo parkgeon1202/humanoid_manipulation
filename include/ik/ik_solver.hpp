@@ -3,6 +3,7 @@
 #include <array>
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <Eigen/Dense>
 #include <pinocchio/multibody/data.hpp>
@@ -125,6 +126,15 @@ double eeXAxisUpAlignment(RobotModel& rm, const Eigen::VectorXd& q);
 Eigen::VectorXd eeXAxisUpAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q,
                                       double k_pull = 1.0, double eps = 1e-4);
 
+// ee_link_1의 로컬 Y축이 world Y축과 얼마나 정렬됐는지를 나타내는 스칼라(+1이면 완벽히
+// 정렬). eeXAxisUpAlignment(로컬 X축 -> world +Z, "놓는 자세"의 방향)는 orientation
+// 3자유도 중 2개만 묶는데(축 하나를 특정 방향에 맞추는 제약은 구면(S²) 위 한 점을
+// 고정하는 것과 같아서 2 DOF), 그 축을 중심으로 한 회전(roll) 1자유도가 안 잡혀서
+// damped LSQ가 임의로 정하는 대로 남게 됨(대화 참고 - "비스듬하게" 되던 원인). 이
+// 정렬을 추가로 같이 걸어서 그 남은 1자유도까지 마저 고정 - 두 제약을 동시에 만족하면
+// orientation 전체(3 DOF)가 결정됨(3D 그래픽의 look-at + up-vector와 동일한 아이디어).
+double eeYAxisAlignment(RobotModel& rm, const Eigen::VectorXd& q);
+
 // torso + 왼팔(오른팔은 항상 고정, kRightArmIndices)을 사용해서 한 스텝 진행. 도달 가능한
 // 거리에서 사용(scripts/lib/ik_solver.py의 ik_step()에 대응). 도달 불가능 모드 전용이었던
 // ik_step_arm_only는 포팅하지 않음 — 그 기능은 곧 허리 고정 회전 방식으로 완전히 대체될 예정.
@@ -132,21 +142,31 @@ IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eig
                      double damping, const IkStepParams& params,
                      const CollisionCheckFn& collision_checker = nullptr);
 
-// eeDownAlignment/eeXAxisUpAlignment처럼 (RobotModel&, q) -> 스칼라 정렬 스코어를 돌려주는
-// 함수. orientationAlignStep이 이 타입으로 어떤 정렬 스코어든 받아서 풂.
+// eeDownAlignment/eeXAxisUpAlignment/eeYAxisAlignment처럼 (RobotModel&, q) -> 스칼라
+// 정렬 스코어를 돌려주는 함수. orientationAlignStep이 이 타입으로 어떤 정렬 스코어든
+// 받아서 풂.
 using AlignmentScoreFn = std::function<double(RobotModel&, const Eigen::VectorXd&)>;
 
-// alignment_fn(q)이 target_score에 도달하도록 torso_yaw + 왼팔 3관절만으로 한 스텝
-// 진행. ikStep과 완전히 같은 구조(damped least squares + trust-region accept/reject)를
-// 3D 위치 대신 1D 스칼라 정렬 오차에 적용한 버전 - VIRTUAL_PLACE 그리퍼 오픈 시퀀스의
-// "놓는 자세" 정렬(eeXAxisUpAlignment)에 씀(fsm.cpp stepPlaceIk 참고). 이전엔
-// eeXAxisUpAlignmentDq로 계산한 dq를 매 tick 고정 크기로 그냥 더하기만 했는데, 그
-// 방식은 threshold를 물리적으로 못 넘는 자세에서 dq가 계속 더해지며 진동했음(대화
-// 참고) - damping이 rho(선형근사 신뢰도)를 보고 스텝 크기를 자동으로 줄여서, 못
-// 넘는 상황이면 damping이 상한까지 올라가며 자연히(진동 없이) 멈추게 함.
-IkStepResult orientationAlignStep(RobotModel& rm, const AlignmentScoreFn& alignment_fn,
-                                   double target_score, const Eigen::VectorXd& q,
-                                   double damping, const IkStepParams& params,
+// orientationAlignStep에 넘기는 정렬 제약 하나 - score_fn(q)가 target_score에
+// 도달하도록 풂. 여러 개를 동시에 넘기면(예: eeXAxisUpAlignment + eeYAxisAlignment)
+// 그만큼의 스칼라 방정식을 한꺼번에 풀어서 orientation의 여러 자유도를 같이 고정함.
+struct AlignmentConstraint {
+  AlignmentScoreFn score_fn;
+  double target_score;
+};
+
+// constraints의 각 score_fn(q)이 각자의 target_score에 도달하도록 torso_yaw + 왼팔
+// 3관절만으로 한 스텝 진행. ikStep과 완전히 같은 구조(damped least squares +
+// trust-region accept/reject)를 3D 위치 대신 N차원 스칼라 정렬 오차 벡터에 적용한
+// 버전 - VIRTUAL_PLACE 그리퍼 오픈 시퀀스의 "놓는 자세" 정렬에 씀(fsm.cpp
+// stepPlaceIk 참고). 이전엔 각 정렬 스코어의 dq를 매 tick 고정 크기로 그냥 더하기만
+// 했는데, 그 방식은 threshold를 물리적으로 못 넘는 자세에서 dq가 계속 더해지며
+// 진동했음(대화 참고) - damping이 rho(선형근사 신뢰도)를 보고 스텝 크기를 자동으로
+// 줄여서, 못 넘는 상황이면 damping이 상한까지 올라가며 자연히(진동 없이) 멈추게 함.
+IkStepResult orientationAlignStep(RobotModel& rm,
+                                   const std::vector<AlignmentConstraint>& constraints,
+                                   const Eigen::VectorXd& q, double damping,
+                                   const IkStepParams& params,
                                    const CollisionCheckFn& collision_checker = nullptr);
 
 namespace detail {

@@ -195,6 +195,14 @@ Eigen::VectorXd eeXAxisUpAlignmentDq(RobotModel& rm, const Eigen::VectorXd& q, d
   return dq;
 }
 
+double eeYAxisAlignment(RobotModel& rm, const Eigen::VectorXd& q) {
+  pinocchio::forwardKinematics(rm.model(), rm.data(), q);
+  pinocchio::updateFramePlacements(rm.model(), rm.data());
+  // 회전행렬의 2번째 열이 로컬 Y축을 world 좌표로 표현한 벡터(R * [0,1,0]^T = R.col(1)).
+  const Eigen::Vector3d local_y_in_world = rm.data().oMf[rm.eeId()].rotation().col(1);
+  return local_y_in_world.dot(Eigen::Vector3d(0.0, 1.0, 0.0));
+}
+
 IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eigen::VectorXd& q,
                      double damping, const IkStepParams& params,
                      const CollisionCheckFn& collision_checker) {
@@ -311,18 +319,25 @@ IkStepResult ikStep(RobotModel& rm, const Eigen::Vector3d& target_pos, const Eig
   return result;
 }
 
-IkStepResult orientationAlignStep(RobotModel& rm, const AlignmentScoreFn& alignment_fn,
-                                   double target_score, const Eigen::VectorXd& q,
-                                   double damping, const IkStepParams& params,
+IkStepResult orientationAlignStep(RobotModel& rm,
+                                   const std::vector<AlignmentConstraint>& constraints,
+                                   const Eigen::VectorXd& q, double damping,
+                                   const IkStepParams& params,
                                    const CollisionCheckFn& collision_checker) {
   const pinocchio::Model& model = rm.model();
   const int nq = model.nq;
+  const int n_constraints = static_cast<int>(constraints.size());
 
-  const double s0 = alignment_fn(rm, q);
-  const double error = target_score - s0;
+  Eigen::VectorXd s0(n_constraints);
+  Eigen::VectorXd error(n_constraints);
+  for (int c = 0; c < n_constraints; ++c) {
+    s0[c] = constraints[c].score_fn(rm, q);
+    error[c] = constraints[c].target_score - s0[c];
+  }
+  const double error_norm = error.norm();
 
   IkStepResult result;
-  if (std::abs(error) < params.tol) {
+  if (error_norm < params.tol) {
     result.q = q;
     result.converged = true;
     result.damping = damping;
@@ -331,27 +346,29 @@ IkStepResult orientationAlignStep(RobotModel& rm, const AlignmentScoreFn& alignm
   }
 
   // torso_yaw + 왼팔 3관절만 활성 - eeXAxisUpAlignmentDq/eeOrientationAlignmentDq와
-  // 동일한 유한차분으로 스칼라 gradient(1 x n_active)를 근사.
+  // 동일한 유한차분으로 각 제약의 gradient를 근사, n_constraints x n_active 행렬로 쌓음.
   std::vector<int> indices = {kTorsoJointIndex};
   for (int idx : kLeftArmIndices) indices.push_back(idx);
   const int n_active = static_cast<int>(indices.size());
   constexpr double eps = 1e-4;
 
-  Eigen::RowVectorXd grad(n_active);
+  Eigen::MatrixXd grad(n_constraints, n_active);
   for (int i = 0; i < n_active; ++i) {
     Eigen::VectorXd q_pert = q;
     q_pert[indices[i]] += eps;
-    grad[i] = (alignment_fn(rm, q_pert) - s0) / eps;
+    for (int c = 0; c < n_constraints; ++c) {
+      grad(c, i) = (constraints[c].score_fn(rm, q_pert) - s0[c]) / eps;
+    }
   }
 
   // damped least squares: [grad; damping*I] dq_active = [error; 0] - ikStep의
   // A_primary/b_primary와 동일한 구성(joint_weight_scale 정규화는 여기선 생략, 4
   // DOF뿐이라 위치 IK만큼 정규화가 절실하지 않음).
-  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(1 + n_active, n_active);
-  A.row(0) = grad;
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(n_constraints + n_active, n_active);
+  A.topRows(n_constraints) = grad;
   A.bottomRows(n_active) = damping * Eigen::MatrixXd::Identity(n_active, n_active);
-  Eigen::VectorXd b = Eigen::VectorXd::Zero(1 + n_active);
-  b[0] = error;
+  Eigen::VectorXd b = Eigen::VectorXd::Zero(n_constraints + n_active);
+  b.topRows(n_constraints) = error;
 
   Eigen::VectorXd lb(n_active);
   Eigen::VectorXd ub(n_active);
@@ -377,13 +394,15 @@ IkStepResult orientationAlignStep(RobotModel& rm, const AlignmentScoreFn& alignm
     return result;
   }
 
-  const double candidate_score = alignment_fn(rm, q_candidate);
-  const double candidate_error = target_score - candidate_score;
+  Eigen::VectorXd candidate_error(n_constraints);
+  for (int c = 0; c < n_constraints; ++c) {
+    candidate_error[c] = constraints[c].target_score - constraints[c].score_fn(rm, q_candidate);
+  }
 
-  const double predicted_delta = grad * dq_active_scaled;
+  const Eigen::VectorXd predicted_delta = grad * dq_active_scaled;
   const double predicted_reduction =
-      error * error - (predicted_delta - error) * (predicted_delta - error);
-  const double actual_reduction = error * error - candidate_error * candidate_error;
+      error_norm * error_norm - (predicted_delta - error).squaredNorm();
+  const double actual_reduction = error_norm * error_norm - candidate_error.squaredNorm();
   const double rho = predicted_reduction < 1e-12 ? -1.0 : actual_reduction / predicted_reduction;
 
   if (rho > params.trust_region_good_ratio) {
