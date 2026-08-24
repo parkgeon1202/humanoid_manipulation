@@ -59,7 +59,7 @@ manipulation_node_cpp:
     ik.damping_increase_factor: 2.0
 
     # 한 스텝에서 "목표에 도달했다"고 볼 위치 오차(m).
-    ik.tol: 0.002
+    ik.tol: 0.003
 
     # 매 스텝 QP로 구한 "이상적인" 보정량 중 실제로 적용할 비율(학습률).
     ik.alpha: 0.5
@@ -195,7 +195,7 @@ manipulation_node_cpp:
 
     # 비전 x/y값의 실측 오프셋(m) - 비전을 캡처하는 순간(PICK_READY와
     # VIRTUAL_PLACE) target_pos_.x()에는 x 오프셋을 더하고 y에서는 y 오프셋을 뺌.
-    ik.vision_x_offset: -0.03
+    ik.vision_x_offset: -0.02
     ik.vision_y_offset: 0.03
 
     # "모터가 목표에 도달했다"는 판정 전부(위 허리+어깨 회전은 물론, COMPLETE_PLACE에서
