@@ -108,7 +108,7 @@ manipulation_node_cpp:
     # 그리퍼 오픈 시퀀스 마지막에 torso_yaw를 이 각도(도)만큼 kick했다가 원래 자리로
     # 되돌림 - 혹시 공이 그리퍼에 걸려있으면 확실히 떨어뜨리기 위함(fsm.hpp
     # place_release_torso_kick_rad 필드 주석 참고).
-    place.release_torso_kick_deg: -5.0
+    place.release_torso_kick_deg: -13.0
 
     # torso_yaw kick/restore 둘 다의 settle 확인 전용 임계값 - 공용
     # pick.complete_grip_settle_*(0.6rad)로는 너무 느슨해서 실제로 kick/restore가
@@ -121,10 +121,11 @@ manipulation_node_cpp:
     # world +Z에 정렬(torso_yaw+왼팔 3관절, ik::orientationAlignStep).
     place.release_orientation_align_threshold: 0.95
 
-    # 위 정렬의 두 번째 제약(로컬 Y축 vs world Y축) 목표 각도(도) - 완전히 맞추는
-    # (0도) 대신 이만큼 벌어진 상태를 목표로 함(fsm.hpp
-    # place_release_orientation_y_angle_rad 필드 주석 참고).
-    place.release_orientation_y_angle_deg: 30.0
+    # 위 정렬 두 제약의 목표 각도(도) - 각 축을 목표 방향에 완전히 맞추는(0도) 대신
+    # 이만큼 벌어진 상태를 목표로 함(fsm.hpp place_release_orientation_x/y_angle_rad
+    # 필드 주석 참고). x: 로컬 X축 vs world +Z, y: 로컬 Y축 vs world Y축.
+    place.release_orientation_x_angle_deg: 50.0
+    place.release_orientation_y_angle_deg: 40.0
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.

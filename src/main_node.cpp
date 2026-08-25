@@ -264,8 +264,10 @@ private:
     // "놓는 자세"(로컬 +X축을 world +Z에 정렬)로 수렴시킬 때 씀.
     tuning.place_release_orientation_align_threshold =
       declare_parameter<double>("place.release_orientation_align_threshold", 0.95);
-    // place_release_orientation_y_angle_rad 필드 주석 참고 - 로컬 Y축을 world Y축에서
-    // 일부러 이만큼(도) 벌린 상태를 목표로 함.
+    // place_release_orientation_x/y_angle_rad 필드 주석 참고 - 각 축을 목표 방향에서
+    // 일부러 이만큼(도) 벌린 상태를 목표로 함(0이면 완전 정렬).
+    tuning.place_release_orientation_x_angle_rad =
+      declare_parameter<double>("place.release_orientation_x_angle_deg", 0.0) * M_PI / 180.0;
     tuning.place_release_orientation_y_angle_rad =
       declare_parameter<double>("place.release_orientation_y_angle_deg", 30.0) * M_PI / 180.0;
 

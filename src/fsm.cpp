@@ -1526,9 +1526,9 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
         const ik::IkStepResult orientation_result = ik::orientationAlignStep(
           robot_model_,
           {
-            {ik::eeXAxisUpAlignment, 1.0},
-            // 로컬 Y축은 world Y축에 완전히(0도) 맞추는 대신 일부러 이만큼 벌어진
-            // 상태를 목표로 함 - 스코어가 내적값이라 목표는 cos(그 각도).
+            // 각 축을 목표 방향에 완전히(0도) 맞추는 대신 일부러 그 각도만큼 벌어진
+            // 상태를 목표로 할 수 있음 - 스코어가 내적값이라 목표는 cos(그 각도).
+            {ik::eeXAxisUpAlignment, std::cos(ik_tuning_.place_release_orientation_x_angle_rad)},
             {ik::eeYAxisAlignment, std::cos(ik_tuning_.place_release_orientation_y_angle_rad)},
           },
           q_, place_release_orientation_damping_, orientation_params);
