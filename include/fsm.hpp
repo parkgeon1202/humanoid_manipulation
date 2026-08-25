@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -122,6 +123,10 @@ struct IkTuning
   // 한 번만 더하는 방식 -> 그다음 고정 step gradient descent를 매 tick 더하는 방식을
   // 거쳐, 지금은 ikStep과 동일한 damped least squares + trust-region으로 수렴시킴.
   double place_release_orientation_align_threshold = 0.95;
+  // 위 정렬의 두 번째 제약(ik::eeYAxisAlignment) 목표 각도(rad) - 로컬 Y축을 world
+  // Y축에 "완전히" 맞추는(0도) 대신 이만큼 벌어진 상태를 목표로 함. 목표 스코어는
+  // 내적값이라 cos(이 각도)를 orientationAlignStep에 넘김(stepPlaceIk 참고).
+  double place_release_orientation_y_angle_rad = 30.0 * M_PI / 180.0;
   // 그리퍼가 열리고 orientation 정렬까지 다 settle된 뒤 - 혹시 공이 그리퍼에
   // 걸려있으면 확실히 떨어뜨리려고 torso_yaw를 이 각도(rad)만큼 한 번 돌렸다가
   // (kick) 다시 원래 자리로 되돌리는(restore) 동작에 씀(stepPlaceIk 참고). 갈 때/

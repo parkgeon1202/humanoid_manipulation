@@ -264,6 +264,10 @@ private:
     // "놓는 자세"(로컬 +X축을 world +Z에 정렬)로 수렴시킬 때 씀.
     tuning.place_release_orientation_align_threshold =
       declare_parameter<double>("place.release_orientation_align_threshold", 0.95);
+    // place_release_orientation_y_angle_rad 필드 주석 참고 - 로컬 Y축을 world Y축에서
+    // 일부러 이만큼(도) 벌린 상태를 목표로 함.
+    tuning.place_release_orientation_y_angle_rad =
+      declare_parameter<double>("place.release_orientation_y_angle_deg", 30.0) * M_PI / 180.0;
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.

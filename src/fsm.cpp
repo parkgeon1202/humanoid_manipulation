@@ -1449,6 +1449,7 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
         std::printf(
           "[place_damping_maxed] damping=%.4f >= max=%.4f - treating as converged\n",
           damping_, ik_tuning_.max_damping);
+          damping_ = ik_tuning_.default_damping;  // 다음 tick부터 다시 정상 범위로 시작
         ik_converged_ = true;
       }
 
@@ -1526,7 +1527,9 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
           robot_model_,
           {
             {ik::eeXAxisUpAlignment, 1.0},
-            {ik::eeYAxisAlignment, 1.0},
+            // 로컬 Y축은 world Y축에 완전히(0도) 맞추는 대신 일부러 이만큼 벌어진
+            // 상태를 목표로 함 - 스코어가 내적값이라 목표는 cos(그 각도).
+            {ik::eeYAxisAlignment, std::cos(ik_tuning_.place_release_orientation_y_angle_rad)},
           },
           q_, place_release_orientation_damping_, orientation_params);
         q_ = orientation_result.q;
@@ -1549,8 +1552,7 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
           {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
           {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
           {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
-        }, ik_tuning_.complete_grip_settle_velocity_threshold,
-        ik_tuning_.complete_grip_settle_position_tolerance_rad))
+        }))
       {
         // orientation이 다 정렬/settle된 뒤 - 그리퍼 오픈 명령.
         gripper_position_ = ik_tuning_.place_gripper_open_rad;
