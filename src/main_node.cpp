@@ -270,6 +270,15 @@ private:
       declare_parameter<double>("place.release_orientation_x_angle_deg", 0.0) * M_PI / 180.0;
     tuning.place_release_orientation_y_angle_rad =
       declare_parameter<double>("place.release_orientation_y_angle_deg", 30.0) * M_PI / 180.0;
+    tuning.place_release_orientation_weight =
+      declare_parameter<double>("place.release_orientation_weight", 1.0);
+    tuning.place_release_bearing_weight =
+      declare_parameter<double>("place.release_bearing_weight", 3.0);
+    // place_release_orientation_y_reference_rotation_rad 필드 주석 참고 - 목표 자세의
+    // 기준 방향을 만들 때 base_link -> target_pos_ 수평 벡터를 Z축으로 이만큼(도) 회전.
+    tuning.place_release_orientation_y_reference_rotation_rad =
+      declare_parameter<double>("place.release_orientation_y_reference_rotation_deg", 90.0) *
+      M_PI / 180.0;
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.

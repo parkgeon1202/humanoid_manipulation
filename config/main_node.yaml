@@ -116,16 +116,26 @@ manipulation_node_cpp:
     place.release_torso_settle_velocity_threshold: 0.1
     place.release_torso_settle_position_tolerance_rad: 0.1
 
-    # 그리퍼 오픈 시퀀스가 "놓는 자세"로 수렴시킬 때 씀(fsm.hpp
-    # place_release_orientation_align_threshold 필드 주석 참고) - gripper 로컬 +X축을
-    # world +Z에 정렬(torso_yaw+왼팔 3관절, ik::orientationAlignStep).
+    # 그리퍼 오픈 시퀀스의 orientation 3개 + y/x 방위 1개 가중 오차 tolerance를 만듦.
+    # 실제 tol은 1.0 - 이 값이므로 0.95이면 0.05.
     place.release_orientation_align_threshold: 0.95
 
-    # 위 정렬 두 제약의 목표 각도(도) - 각 축을 목표 방향에 완전히 맞추는(0도) 대신
-    # 이만큼 벌어진 상태를 목표로 함(fsm.hpp place_release_orientation_x/y_angle_rad
-    # 필드 주석 참고). x: 로컬 X축 vs world +Z, y: 로컬 Y축 vs world Y축.
-    place.release_orientation_x_angle_deg: 50.0
-    place.release_orientation_y_angle_deg: 40.0
+    # 목표 자세(회전행렬)를 만드는 두 각도(도) - fsm.hpp place_release_orientation_x/y_angle_rad
+    #   x: 로컬 X축이 world +Z에서 기울어지는 각도. 부호가 +면 목표 쪽, -면 로봇 쪽.
+    #   y: 로컬 Y축이 수평면에서 world +Z 쪽으로 들리는 각도(양수 = 위로).
+    place.release_orientation_x_angle_deg: -65.0
+    place.release_orientation_y_angle_deg: 0.0
+
+    # orientation 3개와 EE 위치의 y/x 방위를 같은 LSQ로 풀 때 쓰는 task-space 가중치.
+    # 방위는 orientation보다 3배 크게 반영하고, 수렴 판정에도 같은 가중치를 적용함.
+    place.release_orientation_weight: 1.0
+    place.release_bearing_weight: 3.0
+
+    # 목표 자세의 "기준 방향"을 만드는 회전각(도) - base_link(원점)에서 target_pos_로
+    # 향하는 수평 벡터에 Z축 회전행렬을 이 각도로 곱해서 기준 방향을 만듦(fsm.hpp
+    # place_release_orientation_y_reference_rotation_rad 필드 주석 참고).
+    # 90 = 목표 방향에 수직, 0 = 목표 방향 그 자체.
+    place.release_orientation_y_reference_rotation_deg: 90.0
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.

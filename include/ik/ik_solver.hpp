@@ -71,6 +71,10 @@ struct IkStepParams {
   // 비어있으면(size()==0) 전부 0.0으로 취급(Python의 secondary_dq=None과 동일).
   Eigen::VectorXd secondary_dq;
   double secondary_gain = 0.0;
+  // orientationBearingStep 전용 task-space 가중치. LSQ의 Jacobian/error와 수렴
+  // 판정에 동일하게 적용함. 1보다 큰 쪽의 실제 오차를 더 작게 줄여야 수렴함.
+  double orientation_weight = 1.0;
+  double bearing_weight = 1.0;
 };
 
 struct IkStepResult {
@@ -168,6 +172,25 @@ IkStepResult orientationAlignStep(RobotModel& rm,
                                    const Eigen::VectorXd& q, double damping,
                                    const IkStepParams& params,
                                    const CollisionCheckFn& collision_checker = nullptr);
+
+// EE 자세를 target_rotation(회전행렬 전체)에 맞추면서, 동시에 EE의 수평 방위
+// (base_link -> EE의 x,y 기울기)를 target_bearing(단위벡터, base_link -> 목표의 x,y
+// 기울기)에 맞추는 한 스텝. ikStep과 동일한 damped least squares + trust-region 구조.
+// 과제 구성(총 4개 = torso_yaw + 왼팔 3관절, 딱 결정계):
+//   - orientation 3개: axis-angle 오차 log(R_target * R^T), 해석적 각속도 자코비안 사용
+//   - bearing 1개: 수평면에서 EE 방향 x 목표 방위의 외적 z성분(= sin(오차각)), 목표 0
+// bearing을 내적(목표 1)이 아니라 외적(목표 0)으로 쓰는 이유는, 내적은 목표값이 곧
+// 최댓값이라 해 근처에서 gradient가 0으로 죽는데(실측: 5600배 감소) 외적은 0을
+// 가로지르는 값이라 그 근처 기울기가 최대로 유지되기 때문(대화 참고). 같은 이유로
+// orientation도 내적 cone 제약이 아니라 axis-angle 오차를 씀 - 완전 정렬(0도)을
+// 목표로 해도 gradient가 안 죽고, 3개 제약으로 자세가 유일하게 결정됨.
+// params.orientation_weight는 위 3개 orientation 행에, params.bearing_weight는 마지막
+// bearing 행에 적용되며, 같은 가중 오차 norm으로 수렴을 판정함.
+IkStepResult orientationBearingStep(RobotModel& rm, const Eigen::Matrix3d& target_rotation,
+                                     const Eigen::Vector2d& target_bearing,
+                                     const Eigen::VectorXd& q, double damping,
+                                     const IkStepParams& params,
+                                     const CollisionCheckFn& collision_checker = nullptr);
 
 namespace detail {
 // min ||A x - b||^2 s.t. lb <= x <= ub 를 active-set으로 품(box 제약만 지원, n<=8 정도의

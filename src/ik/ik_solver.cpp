@@ -428,4 +428,147 @@ IkStepResult orientationAlignStep(RobotModel& rm,
   return result;
 }
 
+IkStepResult orientationBearingStep(RobotModel& rm, const Eigen::Matrix3d& target_rotation,
+                                     const Eigen::Vector2d& target_bearing,
+                                     const Eigen::VectorXd& q, double damping,
+                                     const IkStepParams& params,
+                                     const CollisionCheckFn& collision_checker) {
+  const pinocchio::Model& model = rm.model();
+  pinocchio::Data& data = rm.data();
+  const int nq = model.nq;
+
+  std::vector<int> indices = {kTorsoJointIndex};
+  for (int idx : kLeftArmIndices) indices.push_back(idx);
+  const int n_active = static_cast<int>(indices.size());
+  constexpr int kTaskRows = 4;  // orientation 3 + bearing 1
+
+  // 수평 방위 스코어: EE의 x,y 방향과 target_bearing의 외적 z성분(= sin(오차각)).
+  // 목표는 0이고, 0을 가로지르는 값이라 해 근처에서도 gradient가 살아있음.
+  const auto bearing_score = [&](const Eigen::VectorXd& q_eval) {
+      pinocchio::forwardKinematics(model, data, q_eval);
+      pinocchio::updateFramePlacements(model, data);
+      const Eigen::Vector3d ee_pos = data.oMf[rm.eeId()].translation();
+      Eigen::Vector2d ee_xy(ee_pos.x(), ee_pos.y());
+      const double norm = ee_xy.norm();
+      if (norm < 1e-9) {
+        return 0.0;
+      }
+      ee_xy /= norm;
+      return ee_xy.x() * target_bearing.y() - ee_xy.y() * target_bearing.x();
+    };
+
+  pinocchio::forwardKinematics(model, data, q);
+  pinocchio::updateFramePlacements(model, data);
+  const Eigen::Matrix3d current_rotation = data.oMf[rm.eeId()].rotation();
+
+  // orientation 오차(3): log(R_target * R^T)를 world 프레임 axis-angle로. Eigen의
+  // AngleAxisd(회전행렬) 생성자가 곧 SO(3) log map이라 pinocchio::log3와 동일한 값.
+  const Eigen::AngleAxisd rotation_error(target_rotation * current_rotation.transpose());
+  const Eigen::Vector3d orientation_error = rotation_error.angle() * rotation_error.axis();
+  const double bearing0 = bearing_score(q);
+
+  const double orientation_weight = std::max(0.0, params.orientation_weight);
+  const double bearing_weight = std::max(0.0, params.bearing_weight);
+  Eigen::VectorXd error(kTaskRows);
+  error << orientation_weight * orientation_error,
+    bearing_weight * -bearing0;  // b = target - current(= 0 - bearing0)
+  const double error_norm = error.norm();
+
+  IkStepResult result;
+  if (error_norm < params.tol) {
+    result.q = q;
+    result.converged = true;
+    result.damping = damping;
+    result.hard_rejected = false;
+    return result;
+  }
+
+  // 과제 자코비안(4 x n_active) - 위 3행은 해석적 각속도 자코비안(LOCAL_WORLD_ALIGNED라
+  // world 프레임 axis-angle 오차와 짝이 맞음), 마지막 1행은 bearing 유한차분.
+  Eigen::Matrix<double, 6, Eigen::Dynamic> J6 =
+      Eigen::Matrix<double, 6, Eigen::Dynamic>::Zero(6, model.nv);
+  pinocchio::computeFrameJacobian(model, data, q, rm.eeId(), pinocchio::LOCAL_WORLD_ALIGNED, J6);
+
+  constexpr double eps = 1e-4;
+  Eigen::MatrixXd task_jacobian(kTaskRows, n_active);
+  for (int i = 0; i < n_active; ++i) {
+    task_jacobian.block<3, 1>(0, i) =
+      orientation_weight * J6.block<3, 1>(3, indices[i]);
+    Eigen::VectorXd q_pert = q;
+    q_pert[indices[i]] += eps;
+    task_jacobian(3, i) =
+      bearing_weight * (bearing_score(q_pert) - bearing0) / eps;
+  }
+
+  // damped least squares: [task_jacobian; damping*I] dq_active = [error; 0] - ikStep의
+  // A_primary/b_primary와 동일한 구성.
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(kTaskRows + n_active, n_active);
+  A.topRows(kTaskRows) = task_jacobian;
+  A.bottomRows(n_active) = damping * Eigen::MatrixXd::Identity(n_active, n_active);
+  Eigen::VectorXd b = Eigen::VectorXd::Zero(kTaskRows + n_active);
+  b.topRows(kTaskRows) = error;
+
+  Eigen::VectorXd lb(n_active);
+  Eigen::VectorXd ub(n_active);
+  for (int i = 0; i < n_active; ++i) {
+    lb[i] = model.lowerPositionLimit[indices[i]] - q[indices[i]];
+    ub[i] = model.upperPositionLimit[indices[i]] - q[indices[i]];
+  }
+
+  const Eigen::VectorXd dq_active = detail::solveBoundedLsq(A, b, lb, ub);
+  const Eigen::VectorXd dq_active_scaled = params.alpha * dq_active;
+
+  Eigen::VectorXd dq = Eigen::VectorXd::Zero(nq);
+  for (int i = 0; i < n_active; ++i) dq[indices[i]] = dq_active_scaled[i];
+
+  Eigen::VectorXd q_candidate(nq);
+  pinocchio::integrate(model, q, dq, q_candidate);
+
+  if (collision_checker && collision_checker(q_candidate)) {
+    result.q = q;
+    result.converged = false;
+    result.damping = std::min(params.max_damping, damping * params.damping_increase_factor);
+    result.hard_rejected = true;
+    return result;
+  }
+
+  const double candidate_bearing = bearing_score(q_candidate);
+  pinocchio::forwardKinematics(model, data, q_candidate);
+  pinocchio::updateFramePlacements(model, data);
+  const Eigen::AngleAxisd candidate_rotation_error(
+    target_rotation * data.oMf[rm.eeId()].rotation().transpose());
+  Eigen::VectorXd candidate_error(kTaskRows);
+  candidate_error <<
+    orientation_weight * candidate_rotation_error.angle() * candidate_rotation_error.axis(),
+    bearing_weight * -candidate_bearing;
+
+  const Eigen::VectorXd predicted_delta = task_jacobian * dq_active_scaled;
+  const double predicted_reduction =
+      error_norm * error_norm - (predicted_delta - error).squaredNorm();
+  const double actual_reduction = error_norm * error_norm - candidate_error.squaredNorm();
+  const double rho = predicted_reduction < 1e-12 ? -1.0 : actual_reduction / predicted_reduction;
+
+  if (rho > params.trust_region_good_ratio) {
+    result.q = q_candidate;
+    result.converged = false;
+    result.damping = std::max(params.min_damping, damping * params.damping_decrease_factor);
+    result.hard_rejected = false;
+    return result;
+  }
+
+  if (rho > params.trust_region_acceptable_ratio) {
+    result.q = q_candidate;
+    result.converged = false;
+    result.damping = damping;
+    result.hard_rejected = false;
+    return result;
+  }
+
+  result.q = q;
+  result.converged = false;
+  result.damping = std::min(params.max_damping, damping * params.damping_increase_factor);
+  result.hard_rejected = false;
+  return result;
+}
+
 }  // namespace ik

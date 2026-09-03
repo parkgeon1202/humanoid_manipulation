@@ -117,19 +117,21 @@ struct IkTuning
   // 진입 시 미리 벌려두는 gripper_open_rad와 별개 값. 그냥 집을 때보다 확실히
   // 떨어뜨리려면 더 크게 벌려야 할 수 있어서 따로 뺌.
   double place_gripper_open_rad = 0.0;
-  // VIRTUAL_PLACE 그리퍼 오픈 시퀀스가 "놓는 자세"로 수렴시킬 때 씀(ik::orientationAlignStep의
-  // tol = 1.0 - 이 값, stepPlaceIk 참고) - gripper 로컬 +X축을 world +Z에 맞춤
-  // (torso_yaw+왼팔 3관절, 대화 참고). 예전엔 shoulder_pitch/elbow에 고정 offset을
-  // 한 번만 더하는 방식 -> 그다음 고정 step gradient descent를 매 tick 더하는 방식을
-  // 거쳐, 지금은 ikStep과 동일한 damped least squares + trust-region으로 수렴시킴.
+  // VIRTUAL_PLACE 그리퍼 오픈 시퀀스가 "놓는 자세"로 수렴시킬 때 씀
+  // (orientationBearingStep의 tol = 1.0 - 이 값, stepPlaceIk 참고).
   double place_release_orientation_align_threshold = 0.95;
-  // 위 정렬 두 제약의 목표 각도(rad) - 각 축을 목표 방향에 "완전히" 맞추는(0도) 대신
-  // 이만큼 벌어진 상태를 목표로 함(0.0이면 완전 정렬). 목표 스코어는 내적값이라
-  // cos(이 각도)를 orientationAlignStep에 넘김(stepPlaceIk 참고).
-  // x: ik::eeXAxisUpAlignment(로컬 X축 vs world +Z), y: ik::eeYAxisAlignment(로컬 Y축
-  // vs world Y축).
+  // orientationBearingStep에 넘길 목표 회전행렬을 만드는 두 각도(rad).
+  // x는 로컬 X축이 world +Z에서 기울어지는 각도, y는 로컬 Y축의 수평면 기준 기울기.
   double place_release_orientation_x_angle_rad = 0.0;
   double place_release_orientation_y_angle_rad = 30.0 * M_PI / 180.0;
+  // orientationBearingStep의 task-space 가중치. 방위 가중치를 더 크게 두면 네 조건을
+  // 동시에 정확히 만족할 수 없을 때 orientation보다 EE 위치의 y/x 방위를 우선함.
+  double place_release_orientation_weight = 1.0;
+  double place_release_bearing_weight = 3.0;
+  // 목표 자세를 만들 때 쓰는 기준 방향의 회전각(rad) - base_link(원점)에서 target_pos_로
+  // 향하는 수평 벡터에 Z축 회전행렬을 이 각도로 곱해서 기준 방향(y_reference)을 만듦
+  // (stepPlaceIk 참고). 90도면 목표 방향에 수직, 0도면 목표 방향 그 자체.
+  double place_release_orientation_y_reference_rotation_rad = 90.0 * M_PI / 180.0;
   // 그리퍼가 열리고 orientation 정렬까지 다 settle된 뒤 - 혹시 공이 그리퍼에
   // 걸려있으면 확실히 떨어뜨리려고 torso_yaw를 이 각도(rad)만큼 한 번 돌렸다가
   // (kick) 다시 원래 자리로 되돌리는(restore) 동작에 씀(stepPlaceIk 참고). 갈 때/
@@ -525,11 +527,15 @@ private:
   double place_tol_ = 0.0;  // 0.0이면 "아직 초기화 안 됨" - state_changed에서 세팅.
   int place_tol_success_streak_ = 0;
   int place_tol_fail_streak_ = 0;
-  // VIRTUAL_PLACE 놓기 전용(stepPlaceIk 참고) - ik::eeXAxisUpAlignment 정렬 스코어가
-  // place_release_orientation_align_threshold를 넘으면 true로 래치되고, 그 뒤로는
-  // q_에 더 이상 orientation 보정 dq를 안 더함.
+  // VIRTUAL_PLACE 놓기 전용(stepPlaceIk 참고) - orientation 3개와 bearing 1개의
+  // 가중 오차가 tolerance 안에 들면 true로 래치되고, 그 뒤로는 q_를 더 보정하지 않음.
   bool place_release_orientation_aligned_ = false;
-  // 위 orientationAlignStep 전용 damping - 메인 IK 루프의 damping_과 동일한 역할이지만
+  // 위치 IK가 끝나고 실측 팔이 그 목표에 도달(settle)한 그 순간의 EE 위치(base_link
+  // 기준, q_로 FK). 놓는 자세 정렬의 방위(bearing) 기준으로 이 위치의 x,y 비율을 씀 -
+  // 그 뒤 orientation IK가 EE를 좌우로 끌고 가지 않게 "지금 도달한 방위를 유지"시키는
+  // 게 목적이라, 비전 캡처 목표가 아니라 실제로 도달한 자리를 기준으로 잡음(대화 참고).
+  Eigen::Vector3d place_release_settled_ee_pos_ = Eigen::Vector3d::Zero();
+  // 위 orientationBearingStep 전용 damping - 메인 IK 루프의 damping_과 동일한 역할이지만
   // 별도 상태로 둠(메인 IK는 이 시점에 이미 ik_converged_라 안 돎). max_damping까지
   // 올라가면(=이 4 DOF로는 도저히 못 맞추는 자세) stepPlaceIk가 그 이상 기다리지 않고
   // place_release_orientation_aligned_를 강제로 true로 래치함.

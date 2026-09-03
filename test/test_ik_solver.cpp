@@ -433,4 +433,48 @@ TEST(IkStep, SecondaryDqIsNullSpaceProjectedAwayFromPosition) {
   EXPECT_TRUE(q_changed) << "secondary_dq가 관절 각도 자체는 실제로 바꿔야 함";
 }
 
+TEST(OrientationBearingStep, OrientationWeightAlsoAppliesToConvergence) {
+  ik::RobotModel rm(TEST_URDF_PATH);
+  const Eigen::VectorXd q = Eigen::VectorXd::Zero(rm.model().nq);
+  pinocchio::forwardKinematics(rm.model(), rm.data(), q);
+  pinocchio::updateFramePlacements(rm.model(), rm.data());
+  const Eigen::Matrix3d current_rotation = rm.data().oMf[rm.eeId()].rotation();
+  const Eigen::Vector3d current_position = rm.data().oMf[rm.eeId()].translation();
+  const Eigen::Vector2d target_bearing = current_position.head<2>().normalized();
+  const Eigen::Matrix3d target_rotation =
+      Eigen::AngleAxisd(0.03, Eigen::Vector3d::UnitX()).toRotationMatrix() * current_rotation;
+
+  ik::IkStepParams params;
+  params.tol = 0.05;
+  params.orientation_weight = 1.0;
+  EXPECT_TRUE(ik::orientationBearingStep(
+      rm, target_rotation, target_bearing, q, 0.01, params).converged);
+
+  params.orientation_weight = 2.0;
+  EXPECT_FALSE(ik::orientationBearingStep(
+      rm, target_rotation, target_bearing, q, 0.01, params).converged);
+}
+
+TEST(OrientationBearingStep, BearingWeightAlsoAppliesToConvergence) {
+  ik::RobotModel rm(TEST_URDF_PATH);
+  const Eigen::VectorXd q = Eigen::VectorXd::Zero(rm.model().nq);
+  pinocchio::forwardKinematics(rm.model(), rm.data(), q);
+  pinocchio::updateFramePlacements(rm.model(), rm.data());
+  const Eigen::Matrix3d target_rotation = rm.data().oMf[rm.eeId()].rotation();
+  const Eigen::Vector3d current_position = rm.data().oMf[rm.eeId()].translation();
+  const Eigen::Vector2d current_bearing = current_position.head<2>().normalized();
+  const Eigen::Rotation2Dd bearing_offset(0.03);
+  const Eigen::Vector2d target_bearing = bearing_offset * current_bearing;
+
+  ik::IkStepParams params;
+  params.tol = 0.05;
+  params.bearing_weight = 1.0;
+  EXPECT_TRUE(ik::orientationBearingStep(
+      rm, target_rotation, target_bearing, q, 0.01, params).converged);
+
+  params.bearing_weight = 2.0;
+  EXPECT_FALSE(ik::orientationBearingStep(
+      rm, target_rotation, target_bearing, q, 0.01, params).converged);
+}
+
 }  // namespace

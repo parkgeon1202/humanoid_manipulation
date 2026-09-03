@@ -149,6 +149,7 @@ void ManipulationFSM::reset()
   place_tol_success_streak_ = 0;
   place_tol_fail_streak_ = 0;
   place_release_orientation_aligned_ = false;
+  place_release_settled_ee_pos_.setZero();
   place_release_orientation_damping_ = ik_tuning_.default_damping;
   place_release_arm_settled_confirmed_ = false;
   place_release_torso_kicked_ = false;
@@ -806,6 +807,7 @@ void ManipulationFSM::solveTickImpl()
       place_tol_success_streak_ = 0;
       place_tol_fail_streak_ = 0;
       place_release_orientation_aligned_ = false;
+      place_release_settled_ee_pos_.setZero();
       place_release_orientation_damping_ = ik_tuning_.default_damping;
       place_release_arm_settled_confirmed_ = false;
       place_release_torso_kicked_ = false;
@@ -1495,6 +1497,13 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       // 아직 실측이 IK 목표에 도달 전 - 그리퍼는 계속 닫힌 채(gripper_position_
       // 유지) 조용히 대기.
     } else {
+      if (!place_release_arm_settled_confirmed_) {
+        // 이 분기에 처음 들어온 tick(= 실측 팔이 위치 IK 목표에 막 도달한 순간)에만
+        // 그때의 EE 위치를 저장 - 아래 놓는 자세 정렬의 방위 기준으로 씀
+        // (place_release_settled_ee_pos_ 필드 주석 참고). 이 분기는 래치 후 매 tick
+        // 다시 들어오므로 조건 없이 덮어쓰면 정렬 중 움직인 EE로 기준이 계속 바뀜.
+        place_release_settled_ee_pos_ = ik::eePosition(robot_model_, q_);
+      }
       place_release_arm_settled_confirmed_ = true;
 
       // place_gripper_open_rad 필드 주석 참고 - PICK_READY 진입용 gripper_open_rad와
@@ -1512,6 +1521,63 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       // 자동 조절해서 못 넘는 상황에서도 damping이 상한까지 올라가며 진동 없이
       // 멈춤(main IK 루프의 damping_ >= max_damping 처리와 동일 패턴).
       if (!place_release_orientation_aligned_) {
+        // 목표 자세(회전행렬)와 목표 수평 방위를 만든 뒤 orientationBearingStep으로
+        // 한 번에 품 - orientation 3개 + 방위 1개 = 4개 = 관절 4개(torso_yaw + 왼팔 3)라
+        // 딱 결정계(대화 참고). 예전엔 내적 cone 제약 2개(X축/Y축)만 걸었는데, 그건
+        // orientation 자유도를 2개만 묶어서 나머지 roll이 임의로 남았고, 목표를 완전
+        // 정렬(내적 1)로 두면 gradient까지 죽는 문제가 있었음.
+        //
+        // 목표 자세를 만드는 순서(전부 기존 튜닝 각도를 그대로 재사용):
+        //   1) reach_dir  : base_link(원점) -> place_release_settled_ee_pos_(위치 IK가
+        //                   끝나 실측이 도달한 그 순간의 EE) 수평 방향 - 그 방위를
+        //                   그대로 유지시키는 게 목적(대화 참고)
+        //   2) y_reference: reach_dir을 Z축으로 y_reference_rotation만큼 돌린 수평 방향
+        //                   (기본 90도 = reach_dir에 수직)
+        //   3) x_dir      : world +Z를 y_reference 축으로 x_angle만큼 기울인 방향
+        //                   (= reach_dir을 품은 수직면 안에서 기울어짐)
+        //   4) y_dir      : x_dir에 수직인 평면 안에서, 수평면에서 world +Z 쪽으로
+        //                   y_angle만큼 들린 방향(양수 = 위로)
+        //   5) z_dir      : x_dir x y_dir (오른손 좌표계 완성)
+        // 목표 수평 방위도 reach_dir 그대로 - 정렬 중에도 EE의 x,y 기울기가 도달
+        // 당시의 기울기에서 안 벗어나게 잡아둠(좌우로 밀리는 걸 막음).
+        Eigen::Vector3d reach_dir(
+          place_release_settled_ee_pos_.x(), place_release_settled_ee_pos_.y(), 0.0);
+        if (reach_dir.norm() < 1e-6) {
+          // 목표가 base_link 바로 위/아래라 수평 방위를 정의할 수 없음 - 예전처럼
+          // world +X를 기준으로 삼아 최소한 자세는 맞추게 함.
+          reach_dir = Eigen::Vector3d(1.0, 0.0, 0.0);
+        }
+        reach_dir.normalize();
+
+        const Eigen::Vector3d y_reference =
+          Eigen::AngleAxisd(
+          ik_tuning_.place_release_orientation_y_reference_rotation_rad,
+          Eigen::Vector3d::UnitZ()).toRotationMatrix() * reach_dir;
+        const Eigen::Vector3d x_dir =
+          Eigen::AngleAxisd(ik_tuning_.place_release_orientation_x_angle_rad, y_reference) *
+          Eigen::Vector3d::UnitZ();
+        // y_dir: x_dir에 수직인 평면 안에서, 수평면 기준 world +Z 쪽으로
+        // y_angle만큼 들린 방향. y_angle을 x_dir 둘레의 roll로 그대로 쓰면 x_dir이
+        // 기울어진 만큼 실제 수평 기울기가 줄어들어(sin 관계) 파라미터 값과 결과가
+        // 달라지므로, 원하는 기울기를 만들어내는 roll을 역산해서 씀(대화 참고).
+        //   y_dir = y_reference*cos(roll) + z_reference*sin(roll)  (y_reference는 수평)
+        //   => y_dir.z = z_reference.z * sin(roll) = sin(y_angle)
+        // z_reference.z의 크기가 곧 도달 가능한 최대 기울기(|sin(x_angle)|)라, 그보다
+        // 큰 각도를 요구하면 도달 가능한 최대치로 clamp됨.
+        const Eigen::Vector3d z_reference = x_dir.cross(y_reference);
+        double y_roll = 0.0;
+        if (std::abs(z_reference.z()) > 1e-9) {
+          y_roll = std::asin(
+            std::clamp(
+              std::sin(ik_tuning_.place_release_orientation_y_angle_rad) / z_reference.z(),
+              -1.0, 1.0));
+        }
+        const Eigen::Vector3d y_dir = Eigen::AngleAxisd(y_roll, x_dir) * y_reference;
+        Eigen::Matrix3d target_rotation;
+        target_rotation.col(0) = x_dir;
+        target_rotation.col(1) = y_dir;
+        target_rotation.col(2) = x_dir.cross(y_dir);
+
         ik::IkStepParams orientation_params;
         orientation_params.tol = 1.0 - ik_tuning_.place_release_orientation_align_threshold;
         orientation_params.alpha = ik_tuning_.alpha;
@@ -1522,15 +1588,12 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
         orientation_params.trust_region_good_ratio = ik_tuning_.trust_region_good_ratio;
         orientation_params.trust_region_acceptable_ratio =
           ik_tuning_.trust_region_acceptable_ratio;
+        orientation_params.orientation_weight =
+          ik_tuning_.place_release_orientation_weight;
+        orientation_params.bearing_weight = ik_tuning_.place_release_bearing_weight;
 
-        const ik::IkStepResult orientation_result = ik::orientationAlignStep(
-          robot_model_,
-          {
-            // 각 축을 목표 방향에 완전히(0도) 맞추는 대신 일부러 그 각도만큼 벌어진
-            // 상태를 목표로 할 수 있음 - 스코어가 내적값이라 목표는 cos(그 각도).
-            {ik::eeXAxisUpAlignment, std::cos(ik_tuning_.place_release_orientation_x_angle_rad)},
-            {ik::eeYAxisAlignment, std::cos(ik_tuning_.place_release_orientation_y_angle_rad)},
-          },
+        const ik::IkStepResult orientation_result = ik::orientationBearingStep(
+          robot_model_, target_rotation, Eigen::Vector2d(reach_dir.x(), reach_dir.y()),
           q_, place_release_orientation_damping_, orientation_params);
         q_ = orientation_result.q;
         place_release_orientation_damping_ = orientation_result.damping;
