@@ -31,17 +31,20 @@
 
 #include <rclcpp/rclcpp.hpp>
 
-#include "dynamixel_hardware_msgs/msg/dynamixel_msgs.hpp"
+#include "dynamixel_interfaces/msg/dynamixel_msgs.hpp"
 #include "geometry_msgs/msg/point32.hpp"
 #include "irc_humanoid_interfaces/msg/vision2_mani_msg.hpp"
 #include "std_msgs/msg/bool.hpp"
 
-using dynamixel_hardware_msgs::msg::DynamixelMsgs;
+using dynamixel_interfaces::msg::DynamixelMsgs;
 using geometry_msgs::msg::Point32;
 using irc_humanoid_interfaces::msg::Vision2ManiMsg;
 using std_msgs::msg::Bool;
 
 namespace {
+
+// main_node.cpp의 kGripMotorId와 동일한 그리퍼 모터 id.
+constexpr uint8_t kGripperMotorId = 6;
 
 // debug_ik_node.cpp의 getKey와 동일: raw 모드로 잠깐 들어가서 timeout 동안 문자
 // 하나를 기다리고, 읽든 못 읽든 매번 원래(cooked) 모드로 복원함.
@@ -113,6 +116,8 @@ class MasterNode : public rclcpp::Node {
 
     DynamixelMsgs gripper_msg;
     gripper_msg.header.stamp = get_clock()->now();
+    // kid_rl은 /gripper_control의 id가 그리퍼(6)가 아니면 메시지를 버림.
+    gripper_msg.id = kGripperMotorId;
     gripper_msg.goal_position = static_cast<float>(gripper_closed_rad_);
     gripper_msg.profile_acceleration = 0.0f;
     gripper_msg.profile_velocity = 1.0f;

@@ -571,4 +571,156 @@ IkStepResult orientationBearingStep(RobotModel& rm, const Eigen::Matrix3d& targe
   return result;
 }
 
+IkStepResult yAxisPositionStep(RobotModel& rm, const Eigen::Vector3d& target_y_direction,
+                               const Eigen::Vector3d& target_position,
+                               const Eigen::VectorXd& q, double damping,
+                               const IkStepParams& params,
+                               const CollisionCheckFn& collision_checker) {
+  const pinocchio::Model& model = rm.model();
+  pinocchio::Data& data = rm.data();
+  const int nq = model.nq;
+
+  std::vector<int> indices = {kTorsoJointIndex};
+  for (int idx : kLeftArmIndices) indices.push_back(idx);
+  const int n_active = static_cast<int>(indices.size());
+  constexpr int kTaskRows = 6;  // y축 정렬 3 + position x/y/z 3
+
+  const double orientation_weight = std::max(0.0, params.orientation_weight);
+  const double position_xy_weight = std::max(0.0, params.position_xy_weight);
+  const double height_weight = std::max(0.0, params.height_weight);
+
+  // 현재 로컬 Y축을 target_y_direction으로 보내는 최소 회전(axis * angle). 두 축이
+  // 이미 같으면 0, 정반대면 임의의 수직축으로 pi.
+  const auto y_align_error_of = [&](const Eigen::Matrix3d& rotation) {
+      const Eigen::Vector3d y_current = rotation.col(1);
+      const Eigen::Vector3d cross = y_current.cross(target_y_direction);
+      const double cross_norm = cross.norm();
+      const double dot = y_current.dot(target_y_direction);
+      if (cross_norm > 1e-9) {
+        return Eigen::Vector3d(cross / cross_norm * std::atan2(cross_norm, dot));
+      }
+      if (dot < 0.0) {
+        const Eigen::Vector3d seed = std::abs(y_current.x()) < 0.9 ?
+          Eigen::Vector3d::UnitX() : Eigen::Vector3d::UnitY();
+        return Eigen::Vector3d(y_current.cross(seed).normalized() * M_PI);
+      }
+      return Eigen::Vector3d(Eigen::Vector3d::Zero());
+    };
+
+  pinocchio::forwardKinematics(model, data, q);
+  pinocchio::updateFramePlacements(model, data);
+  const Eigen::Vector3d y_align_error = y_align_error_of(data.oMf[rm.eeId()].rotation());
+  const Eigen::Vector3d position_error =
+    target_position - data.oMf[rm.eeId()].translation();
+
+  Eigen::VectorXd error(kTaskRows);
+  error << orientation_weight * y_align_error,
+    position_xy_weight * position_error.x(),
+    position_xy_weight * position_error.y(),
+    height_weight * position_error.z();
+  const double error_norm = error.norm();
+
+  IkStepResult result;
+  if (error_norm < params.tol) {
+    result.q = q;
+    result.converged = true;
+    result.damping = damping;
+    result.hard_rejected = false;
+    return result;
+  }
+
+  // 과제 자코비안(6 x n_active) - 0~2행은 각속도, 3~5행은 위치 자코비안.
+  Eigen::Matrix<double, 6, Eigen::Dynamic> J6 =
+      Eigen::Matrix<double, 6, Eigen::Dynamic>::Zero(6, model.nv);
+  pinocchio::computeFrameJacobian(model, data, q, rm.eeId(), pinocchio::LOCAL_WORLD_ALIGNED, J6);
+
+  Eigen::MatrixXd task_jacobian(kTaskRows, n_active);
+  for (int i = 0; i < n_active; ++i) {
+    task_jacobian.block<3, 1>(0, i) = orientation_weight * J6.block<3, 1>(3, indices[i]);
+    task_jacobian(3, i) = position_xy_weight * J6(0, indices[i]);
+    task_jacobian(4, i) = position_xy_weight * J6(1, indices[i]);
+    task_jacobian(5, i) = height_weight * J6(2, indices[i]);
+  }
+
+  // damped least squares: [task_jacobian; damping*I; weight_block] dq_active = [error; 0; 0].
+  // weight_block은 ikStep의 joint_weight_scale 정규화와 동일한 형태 - 대각에
+  // joint_weight_scale * sqrt(joint_weights[관절])를 넣어서, 값이 큰 관절일수록
+  // 그 관절을 덜 쓰게(움직임에 더 큰 벌점) 만듦(예: 어깨를 무겁게).
+  const Eigen::VectorXd joint_weights =
+      params.joint_weights.size() == nq ? params.joint_weights : Eigen::VectorXd::Ones(nq);
+  Eigen::MatrixXd weight_block = Eigen::MatrixXd::Zero(n_active, n_active);
+  for (int i = 0; i < n_active; ++i) {
+    weight_block(i, i) = params.joint_weight_scale * std::sqrt(joint_weights[indices[i]]);
+  }
+
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(kTaskRows + n_active + n_active, n_active);
+  A.topRows(kTaskRows) = task_jacobian;
+  A.middleRows(kTaskRows, n_active) = damping * Eigen::MatrixXd::Identity(n_active, n_active);
+  A.bottomRows(n_active) = weight_block;
+  Eigen::VectorXd b = Eigen::VectorXd::Zero(kTaskRows + n_active + n_active);
+  b.topRows(kTaskRows) = error;
+
+  Eigen::VectorXd lb(n_active);
+  Eigen::VectorXd ub(n_active);
+  for (int i = 0; i < n_active; ++i) {
+    lb[i] = model.lowerPositionLimit[indices[i]] - q[indices[i]];
+    ub[i] = model.upperPositionLimit[indices[i]] - q[indices[i]];
+  }
+
+  const Eigen::VectorXd dq_active = detail::solveBoundedLsq(A, b, lb, ub);
+  const Eigen::VectorXd dq_active_scaled = params.alpha * dq_active;
+
+  Eigen::VectorXd dq = Eigen::VectorXd::Zero(nq);
+  for (int i = 0; i < n_active; ++i) dq[indices[i]] = dq_active_scaled[i];
+
+  Eigen::VectorXd q_candidate(nq);
+  pinocchio::integrate(model, q, dq, q_candidate);
+
+  if (collision_checker && collision_checker(q_candidate)) {
+    result.q = q;
+    result.converged = false;
+    result.damping = std::min(params.max_damping, damping * params.damping_increase_factor);
+    result.hard_rejected = true;
+    return result;
+  }
+
+  pinocchio::forwardKinematics(model, data, q_candidate);
+  pinocchio::updateFramePlacements(model, data);
+  const Eigen::Vector3d candidate_position_error =
+    target_position - data.oMf[rm.eeId()].translation();
+  Eigen::VectorXd candidate_error(kTaskRows);
+  candidate_error << orientation_weight * y_align_error_of(data.oMf[rm.eeId()].rotation()),
+    position_xy_weight * candidate_position_error.x(),
+    position_xy_weight * candidate_position_error.y(),
+    height_weight * candidate_position_error.z();
+
+  const Eigen::VectorXd predicted_delta = task_jacobian * dq_active_scaled;
+  const double predicted_reduction =
+      error_norm * error_norm - (predicted_delta - error).squaredNorm();
+  const double actual_reduction = error_norm * error_norm - candidate_error.squaredNorm();
+  const double rho = predicted_reduction < 1e-12 ? -1.0 : actual_reduction / predicted_reduction;
+
+  if (rho > params.trust_region_good_ratio) {
+    result.q = q_candidate;
+    result.converged = false;
+    result.damping = std::max(params.min_damping, damping * params.damping_decrease_factor);
+    result.hard_rejected = false;
+    return result;
+  }
+
+  if (rho > params.trust_region_acceptable_ratio) {
+    result.q = q_candidate;
+    result.converged = false;
+    result.damping = damping;
+    result.hard_rejected = false;
+    return result;
+  }
+
+  result.q = q;
+  result.converged = false;
+  result.damping = std::min(params.max_damping, damping * params.damping_increase_factor);
+  result.hard_rejected = false;
+  return result;
+}
+
 }  // namespace ik

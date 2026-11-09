@@ -477,4 +477,25 @@ TEST(OrientationBearingStep, BearingWeightAlsoAppliesToConvergence) {
       rm, target_rotation, target_bearing, q, 0.01, params).converged);
 }
 
+TEST(YAxisPositionStep, PositionWeightsAlsoApplyToConvergence) {
+  ik::RobotModel rm(TEST_URDF_PATH);
+  const Eigen::VectorXd q = Eigen::VectorXd::Zero(rm.model().nq);
+  pinocchio::forwardKinematics(rm.model(), rm.data(), q);
+  pinocchio::updateFramePlacements(rm.model(), rm.data());
+  const Eigen::Matrix3d current_rotation = rm.data().oMf[rm.eeId()].rotation();
+  const Eigen::Vector3d current_position = rm.data().oMf[rm.eeId()].translation();
+
+  ik::IkStepParams params;
+  params.tol = 0.04;
+  params.position_xy_weight = 1.0;
+  EXPECT_TRUE(ik::yAxisPositionStep(
+      rm, current_rotation.col(1), current_position + Eigen::Vector3d(0.03, 0.0, 0.0),
+      q, 0.01, params).converged);
+
+  params.position_xy_weight = 5.0;
+  EXPECT_FALSE(ik::yAxisPositionStep(
+      rm, current_rotation.col(1), current_position + Eigen::Vector3d(0.03, 0.0, 0.0),
+      q, 0.01, params).converged);
+}
+
 }  // namespace

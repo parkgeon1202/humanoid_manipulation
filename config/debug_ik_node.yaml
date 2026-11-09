@@ -4,6 +4,9 @@ debug_ik_node:
     control_topic: /dynamixel_control
     gripper_topic: /gripper_control
     status_topic: /motor_status
+    # /motor_status(DynamixelStateMsgs) header.stamp가 이보다 오래되면 버림. 마지막 정상
+    # 상태가 이보다 오래되면 모터 명령을 안 보냄. kid_rl은 50 Hz로 보냄.
+    status_timeout_sec: 0.2
 
     # fsm.cpp의 entry_motion_number()가 SIT 진입 시 재생하는 모션 번호(73)와 동일.
     # 이 노드는 FSM이 없어서 노드가 뜨자마자 딱 한 번 직접 재생함.
@@ -106,9 +109,8 @@ debug_ik_node:
     # 판정하는 기준. 두 조건을 모두 만족해야 "도달"로 보고 도달 가능 IK로 자동
     # 전환함: 모터 속도가 이 값 미만이고, 동시에 목표와의 위치 차이가 아래 값(rad)
     # 이내. 속도만 보면 회전 명령 직후(아직 움직이기 전) 첫 틱에 "이미 도달했다"고
-    # 오판할 수 있어서 위치 조건을 반드시 같이 봄. CurrentMotorStatus.velocity는
-    # rad/s가 아니라 raw uint8 단위라서(msg/CurrentMotorStatus.msg 참고),
-    # main_node.yaml의 같은 이름 파라미터(ik.torso_settle_velocity_threshold)와
+    # 오판할 수 있어서 위치 조건을 반드시 같이 봄. velocity는 DynamixelMotorState.velocity
+    # (rad/s)이고, main_node.yaml의 같은 이름 파라미터(ik.torso_settle_velocity_threshold)와
     # 동일한 스케일(0.3)을 그대로 씀. 팔+torso_yaw가 모두 settle되면 바로 도달
     # 가능 IK로 넘어가고, 그 뒤로는 torso_yaw도 IK가 필요한 만큼 더 자유롭게 돌림.
     ik.torso_settle_velocity_threshold: 0.3

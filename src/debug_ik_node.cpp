@@ -29,6 +29,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -39,25 +40,27 @@
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <rclcpp/rclcpp.hpp>
 
-#include "dynamixel_hardware_msgs/msg/current_motor_status.hpp"
-#include "dynamixel_hardware_msgs/msg/dynamixel_control_msgs.hpp"
+#include "dynamixel_interfaces/msg/dynamixel_control_msgs.hpp"
+#include "dynamixel_interfaces/msg/dynamixel_state_msgs.hpp"
 #include "ik/collision_model.hpp"
 #include "ik/ik_solver.hpp"
 #include "irc_humanoid_interfaces/msg/motion_operator.hpp"
 #include "irc_humanoid_interfaces/msg/vision2_master_msg.hpp"
+#include "motor_io.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 
-using dynamixel_hardware_msgs::msg::CurrentMotorStatus;
-using dynamixel_hardware_msgs::msg::DynamixelControlMsgs;
-using dynamixel_hardware_msgs::msg::DynamixelMsgs;
+using dynamixel_interfaces::msg::DynamixelControlMsgs;
+using dynamixel_interfaces::msg::DynamixelMsgs;
+using dynamixel_interfaces::msg::DynamixelStateMsgs;
 using irc_humanoid_interfaces::msg::MotionOperator;
 using irc_humanoid_interfaces::msg::Vision2MasterMsg;
 
 namespace {
 
-// debug_node.cpp의 kMotorIdOrder와 동일(같은 순서로 dynamixel_control/motor_status
-// 배열이 채워짐). tilt(23번)는 이 시스템에서 아예 제어 안 해서 목록에서 뺌.
+// main_node.cpp의 kMotorIdOrder와 동일 - 이 노드가 상태를 읽고 명령을 보내는 모터 id.
+// 메시지 원소마다 id가 실려 있어서 배열 순서와는 상관없음(상태는 id로 찾음).
+// tilt(23번)는 이 노드에서 안 쓰므로 목록에서 뺌.
 const std::vector<std::string> kMotorIdOrder = {
     "0", "1", "2", "3", "4", "5", "6", "10", "11", "12", "13", "14",
     "15", "16", "17", "18", "19", "20", "21", "22"};
@@ -123,6 +126,10 @@ class DebugIkNode : public rclcpp::Node {
 
   DebugIkNode() : rclcpp::Node("debug_ik_node"), rm_(resolveUrdfPath()), collision_checker_(rm_) {
     declareAndReadParameters();
+    required_status_ids_ = motor_io::parse_motor_ids(kMotorIdOrder);
+    if (required_status_ids_.empty()) {
+      throw std::runtime_error("Invalid or duplicated motor id in kMotorIdOrder");
+    }
 
     auto motor_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
     control_pub_ = create_publisher<DynamixelControlMsgs>(control_topic_, motor_qos);
@@ -131,9 +138,9 @@ class DebugIkNode : public rclcpp::Node {
         create_publisher<sensor_msgs::msg::JointState>("joint_states", rclcpp::QoS(10));
     target_marker_pub_ =
         create_publisher<visualization_msgs::msg::Marker>("/target_marker", rclcpp::QoS(10));
-    status_sub_ = create_subscription<CurrentMotorStatus>(
+    status_sub_ = create_subscription<DynamixelStateMsgs>(
         status_topic_, motor_qos,
-        [this](const CurrentMotorStatus::SharedPtr msg) { onMotorStatus(msg); });
+        [this](const DynamixelStateMsgs::SharedPtr msg) { onMotorStatus(msg); });
     // debug_node.cpp와 동일하게 master를 거치지 않고 비전 노드가 보내는 /vision을
     // 직접 구독함(단독 디버그 노드라 FSM/master가 없음).
     vision_sub_ = create_subscription<Vision2MasterMsg>(
@@ -180,6 +187,7 @@ class DebugIkNode : public rclcpp::Node {
     control_topic_ = declare_parameter<std::string>("control_topic", "/dynamixel_control");
     gripper_topic_ = declare_parameter<std::string>("gripper_topic", "/gripper_control");
     status_topic_ = declare_parameter<std::string>("status_topic", "/motor_status");
+    status_timeout_sec_ = declare_parameter<double>("status_timeout_sec", 0.2);
     // fsm.cpp의 entry_motion_number()가 SIT 진입 시 재생하는 모션 번호(73)와 동일
     // - FSM이 없는 이 노드에서는 시작 시점에 딱 한 번 직접 재생함.
     startup_motion_num_ = declare_parameter<int>("motion.startup_motion_num", 73);
@@ -239,7 +247,7 @@ class DebugIkNode : public rclcpp::Node {
     // 미만이고 동시에 목표와의 위치 차이가 torso_settle_position_tolerance_rad(rad)
     // 이내면 "도달"로 보고 도달 가능 IK로 자동 전환함. 속도만 보면 명령 직후(아직
     // 움직이기 전) 첫 틱에 오판할 수 있어서 위치 조건을 반드시 같이 봄.
-    // CurrentMotorStatus.velocity는 rad/s 단위이고,
+    // DynamixelMotorState.velocity는 rad/s 단위이고,
     // debug_node.cpp의 arm_settled_velocity_threshold 기본값(0.3)과 동일한
     // 스케일을 그대로 씀.
     torso_settle_velocity_threshold_ =
@@ -268,15 +276,29 @@ class DebugIkNode : public rclcpp::Node {
     damping_ = default_damping_;
   }
 
-  void onMotorStatus(const CurrentMotorStatus::SharedPtr msg) {
-    const size_t n = std::min(kMotorIdOrder.size(), msg->position.size());
-    for (size_t i = 0; i < n; ++i) {
-      motor_positions_[kMotorIdOrder[i]] = msg->position[i];
+  // id 검사(motor_io.hpp 참고)를 통과한 메시지만 씀 - 실패하면 이전 값 유지.
+  void onMotorStatus(const DynamixelStateMsgs::SharedPtr msg) {
+    std::map<uint8_t, motor_io::MotorState> states;
+    std::string reason;
+    const rclcpp::Time now = get_clock()->now();
+    if (!motor_io::decode_status(*msg, now, status_timeout_sec_, required_status_ids_, states,
+                                 reason)) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "Drop motor_status: %s",
+                           reason.c_str());
+      return;
     }
-    const size_t nv = std::min(kMotorIdOrder.size(), msg->velocity.size());
-    for (size_t i = 0; i < nv; ++i) {
-      motor_velocities_[kMotorIdOrder[i]] = msg->velocity[i];
+    for (const auto& motor_id : kMotorIdOrder) {
+      const auto& state = states.at(*motor_io::parse_motor_id(motor_id));
+      motor_positions_[motor_id] = state.position;
+      motor_velocities_[motor_id] = state.velocity;
     }
+    last_valid_status_ns_ = now.nanoseconds();
+  }
+
+  bool statusFresh() {
+    if (last_valid_status_ns_ == 0) return false;
+    const double age_sec = (get_clock()->now().nanoseconds() - last_valid_status_ns_) * 1e-9;
+    return age_sec <= status_timeout_sec_;
   }
 
   void onVision(const Vision2MasterMsg::SharedPtr msg) {
@@ -495,32 +517,48 @@ class DebugIkNode : public rclcpp::Node {
     }
     goal_by_motor[kGripperMotorId] = gripper_position_;
 
-    DynamixelControlMsgs msg;
+    // 상태가 없거나 끊기면 안 보냄 - 조종 안 하는 모터는 실측 위치(motor_positions_)를
+    // 그대로 되돌려보내는 구조라, 상태 없이 보내면 그 모터가 0 rad/옛 위치로 튐.
     const auto stamp = get_clock()->now();
-    msg.motor_control.reserve(kMotorIdOrder.size() - 1);
-    for (const auto& motor_id : kMotorIdOrder) {
-      if (motor_id == kGripperMotorId) {
-        continue;
+    if (!statusFresh()) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000,
+                            "Motor command not sent: no valid motor_status within %.3f s",
+                            status_timeout_sec_);
+    } else {
+      // 원소마다 id를 채움. 목표가 없는 모터는 빼고 보냄(kid_rl이 현재 목표 유지).
+      std::string reason;
+      bool ok = true;
+      DynamixelControlMsgs msg;
+      msg.motor_control.reserve(kMotorIdOrder.size() - 1);
+      for (const auto& motor_id : kMotorIdOrder) {
+        if (motor_id == kGripperMotorId) {
+          continue;
+        }
+        const auto it = goal_by_motor.find(motor_id);
+        if (it == goal_by_motor.end()) {
+          continue;
+        }
+        DynamixelMsgs motor_msg;
+        if (!motor_io::make_command(*motor_io::parse_motor_id(motor_id), it->second,
+                                    profile_velocity, stamp, motor_msg, reason)) {
+          ok = false;
+          break;
+        }
+        msg.motor_control.push_back(motor_msg);
       }
-      DynamixelMsgs motor_msg;
-      motor_msg.header.stamp = stamp;
-      const auto it = goal_by_motor.find(motor_id);
-      motor_msg.goal_position =
-          static_cast<float>(it != goal_by_motor.end() ? it->second : 0.0);
-      motor_msg.profile_acceleration = 0.0f;
-      motor_msg.profile_velocity = static_cast<float>(profile_velocity);
-      msg.motor_control.push_back(motor_msg);
+      DynamixelMsgs gripper_msg;
+      if (ok && !motor_io::make_command(*motor_io::parse_motor_id(kGripperMotorId),
+                                        gripper_position_, profile_velocity, stamp, gripper_msg,
+                                        reason)) {
+        ok = false;
+      }
+      if (!ok) {
+        RCLCPP_ERROR(get_logger(), "Motor command not sent: %s", reason.c_str());
+      } else {
+        if (!msg.motor_control.empty()) control_pub_->publish(msg);
+        gripper_pub_->publish(gripper_msg);
+      }
     }
-    control_pub_->publish(msg);
-
-    DynamixelMsgs gripper_msg;
-    gripper_msg.header.stamp = stamp;
-    const auto grip_it = goal_by_motor.find(kGripperMotorId);
-    gripper_msg.goal_position =
-        static_cast<float>(grip_it != goal_by_motor.end() ? grip_it->second : 0.0);
-    gripper_msg.profile_acceleration = 0.0f;
-    gripper_msg.profile_velocity = static_cast<float>(profile_velocity);
-    gripper_pub_->publish(gripper_msg);
 
     sensor_msgs::msg::JointState js;
     js.header.stamp = stamp;
@@ -594,7 +632,7 @@ class DebugIkNode : public rclcpp::Node {
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr target_marker_pub_;
   rclcpp::Publisher<MotionOperator>::SharedPtr motion_operator_pub_;
-  rclcpp::Subscription<CurrentMotorStatus>::SharedPtr status_sub_;
+  rclcpp::Subscription<DynamixelStateMsgs>::SharedPtr status_sub_;
   rclcpp::Subscription<Vision2MasterMsg>::SharedPtr vision_sub_;
   rclcpp::TimerBase::SharedPtr timer_;
 
@@ -608,6 +646,11 @@ class DebugIkNode : public rclcpp::Node {
   std::map<std::string, double> motor_positions_;
   std::map<std::string, double> motor_velocities_;
   std::map<std::string, double> frozen_motor_positions_;
+  // /motor_status가 이보다 오래되면 버리고, 마지막 정상 상태가 이보다 오래되면 명령 안 보냄.
+  double status_timeout_sec_ = 0.2;
+  std::vector<uint8_t> required_status_ids_;
+  // spin 스레드(onMotorStatus/onTick)에서만 씀. 0 = 아직 없음.
+  int64_t last_valid_status_ns_ = 0;
 
   Eigen::VectorXd q_;
   double gripper_position_ = 0.0;

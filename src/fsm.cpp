@@ -20,6 +20,18 @@ const std::string kLeftShoulderPitchMotorId = "0";
 const std::string kLeftShoulderRollMotorId = "2";
 const std::string kLeftElbowMotorId = "4";
 const std::string kGripMotorId = "6";
+const std::string kRightShoulderPitchMotorId = "1";
+const std::string kRightShoulderRollMotorId = "3";
+const std::string kRightElbowMotorId = "5";
+
+// PICK 완료(DONE) 복귀 자세(rad) - kid_rl/config/controllers.yaml의 hold_positions와
+// 같은 값으로 유지할 것(보행 시작 시 팔이 다시 움직이지 않게 하려는 목적).
+constexpr double kDoneLeftShoulderPitchRad = -0.5235987755982988;   // 30도 앞
+constexpr double kDoneLeftShoulderRollRad = 0.0;
+constexpr double kDoneLeftElbowRad = -1.5707963267948966;           // 90도 앞
+constexpr double kDoneRightShoulderPitchRad = 0.5235987755982988;   // 30도 앞
+constexpr double kDoneRightShoulderRollRad = 0.0;
+constexpr double kDoneRightElbowRad = 1.0471975511965976;           // 60도 앞
 
 // 비전 쪽이 탐지 실패를 알리는 통짜 센티널 값(x/y/z 셋 다 이 값) -
 // tryCapturePendingVision() 참고.
@@ -628,8 +640,8 @@ void ManipulationFSM::onMotorFeedbackImpl()
         grip_wiggle_kicked_ = false;
         grip_wiggle_restore_commanded_ = false;
         advance();  // COMPLETE_GRIP -> DONE
-        // 곧바로 deactivate하지 않음 - solveTickImpl()의 stepDoneHoming()이 왼팔을
-        // 한 번 더 home_q로 복귀시키고 settle까지 확인한 뒤에 deactivate함.
+        // 곧바로 deactivate하지 않음 - solveTickImpl()의 stepDoneHoming()이 양팔을
+        // 보행 hold 자세로 옮기고 settle까지 확인한 뒤에 deactivate함.
       }
     }
     makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/1.0,
@@ -887,7 +899,7 @@ void ManipulationFSM::solveTickImpl()
         duration * 0.7, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y,
         start_pos.z() + vz * duration * 1.0);
       place_trajectory_.put_point(
-        duration * 0.8, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y,
+        duration * 0.8, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
         start_pos.z() + vz * duration +  0.08);
       place_trajectory_.put_point(
         duration * 0.9, target_pos_.x()-0.08, target_pos_.y() + ik_tuning_.place_apex_y-0.05,
@@ -1003,17 +1015,26 @@ void ManipulationFSM::stepCompleteGripHoming(bool state_changed)
                       /*play_motion_number=*/motion, /*deactivate_and_notify=*/false);
 }
 
-// 그립 위글까지 끝나서 DONE에 진입한 직후: 곧바로 deactivate하지 않고, 왼팔을
-// 0.0(홈)으로 복귀시켜 전부 settle될 때까지 기다린 뒤에야 deactivate함
+// 그립 위글까지 끝나서 DONE에 진입한 직후: 곧바로 deactivate하지 않고, 양팔을
+// 보행 hold 자세(kid_rl hold_positions)로, 허리를 0으로 옮겨 전부 settle될 때까지
+// 기다린 뒤에야 deactivate함
 // (stepCompletePlaceHoming()과 동일한 command-once + settle-poll 패턴).
 void ManipulationFSM::stepDoneHoming(bool state_changed)
 {
   if (state_changed) {
     q_ = Eigen::VectorXd::Zero(robot_model_.model().nq);
+    q_[ik::kLeftArmIndices[0]] = kDoneLeftShoulderPitchRad;
+    q_[ik::kLeftArmIndices[1]] = kDoneLeftShoulderRollRad;
+    q_[ik::kLeftArmIndices[2]] = kDoneLeftElbowRad;
     set_motor_goal_position(kTorsoMotorId, q_[ik::kTorsoJointIndex]);
     set_motor_goal_position(kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]);
     set_motor_goal_position(kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]);
     set_motor_goal_position(kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]);
+    // 오른팔은 IK 대상이 아니라서 q_에 넣지 않고(q_의 오른팔은 IK/충돌 체크에서 계속 0)
+    // 모터 목표만 보냄.
+    set_motor_goal_position(kRightShoulderPitchMotorId, kDoneRightShoulderPitchRad);
+    set_motor_goal_position(kRightShoulderRollMotorId, kDoneRightShoulderRollRad);
+    set_motor_goal_position(kRightElbowMotorId, kDoneRightElbowRad);
   }
 
   // DONE 재활성화 시(place 단계 시작) onActivatedImpl()이 모션(75)을 재생하는데,
@@ -1030,6 +1051,9 @@ void ManipulationFSM::stepDoneHoming(bool state_changed)
       {kLeftShoulderPitchMotorId, q_[ik::kLeftArmIndices[0]]},
       {kLeftShoulderRollMotorId, q_[ik::kLeftArmIndices[1]]},
       {kLeftElbowMotorId, q_[ik::kLeftArmIndices[2]]},
+      {kRightShoulderPitchMotorId, kDoneRightShoulderPitchRad},
+      {kRightShoulderRollMotorId, kDoneRightShoulderRollRad},
+      {kRightElbowMotorId, kDoneRightElbowRad},
     });
 
   makeActionSnapshot(/*publish_motor_command=*/true, /*profile_velocity=*/0.0,
@@ -1215,7 +1239,7 @@ void ManipulationFSM::stepPickReady(bool state_changed)
     // y가 0에 아주 가까우면(공이 거의 정면) 굳이 허리를 돌릴 필요가 없으므로
     // q_[torso]를 state_changed에서 읽어둔 실측값 그대로 둠(새 명령도 안 보냄) -
     // 그 값 그대로 아래 2단계 settle 확인만 거쳐서 넘어감.
-    if (std::fabs(target_pos_.y()) >= 0.02) {
+    if (std::fabs(target_pos_.y()) >= 0.04) {
       q_[ik::kTorsoJointIndex] = (target_pos_.y() >= 0.0)
         ? ik_tuning_.pick_ready_torso_bias_rad * 0.0
         : -ik_tuning_.pick_ready_torso_bias_rad;
@@ -1499,7 +1523,7 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
     } else {
       if (!place_release_arm_settled_confirmed_) {
         // 이 분기에 처음 들어온 tick(= 실측 팔이 위치 IK 목표에 막 도달한 순간)에만
-        // 그때의 EE 위치를 저장 - 아래 놓는 자세 정렬의 방위 기준으로 씀
+        // 그때의 EE 위치를 저장 - 아래 놓는 자세 정렬의 x/y/z 위치 기준으로 씀
         // (place_release_settled_ee_pos_ 필드 주석 참고). 이 분기는 래치 후 매 tick
         // 다시 들어오므로 조건 없이 덮어쓰면 정렬 중 움직인 EE로 기준이 계속 바뀜.
         place_release_settled_ee_pos_ = ik::eePosition(robot_model_, q_);
@@ -1509,74 +1533,23 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
       // place_gripper_open_rad 필드 주석 참고 - PICK_READY 진입용 gripper_open_rad와
       // 별개 값(놓을 때 확실히 떨어뜨리려고 더 크게 벌릴 수 있음). 실제 명령은 아래
       // orientation 정렬까지 settle된 뒤에 나감.
-      // 고정 offset을 한 번만 더하던 예전 방식, 그다음 고정 step gradient descent를
-      // 매 tick 그냥 더하던 방식(대화 참고 - threshold를 못 넘는 자세에서 계속
-      // 진동하는 문제가 있었음) 둘 다 대신, ikStep과 동일한 damped least squares +
-      // trust-region 구조(orientationAlignStep)로 gripper orientation을 정렬시킴 -
-      // 로컬 X축->world +Z 제약 하나만으로는 orientation 3자유도 중 2개만 묶여서
-      // 그 축을 중심으로 한 회전(roll) 1자유도가 안 잡히고 임의로 남음(대화 참고 -
-      // "비스듬하게" 되던 원인). 로컬 Y축->world Y축 제약을 같이 걸어서 남은
-      // 자유도까지 마저 고정 - 두 제약을 동시에 만족하면 orientation 전체가 결정됨
-      // (look-at + up-vector와 동일한 아이디어). damping이 rho를 보고 스텝 크기를
-      // 자동 조절해서 못 넘는 상황에서도 damping이 상한까지 올라가며 진동 없이
-      // 멈춤(main IK 루프의 damping_ >= max_damping 처리와 동일 패턴).
+      // Y축 정렬과 x/y/z 위치를 damped least squares + trust-region으로 함께 푼다.
+      // 활성 관절 4개보다 실효 제약이 하나 많으므로 위치 가중치를 크게 두어 공을 놓는
+      // 지점을 우선하고, Y축은 가능한 범위에서 최대한 맞춘다.
       if (!place_release_orientation_aligned_) {
-        // 목표 자세(회전행렬)와 목표 수평 방위를 만든 뒤 orientationBearingStep으로
-        // 한 번에 품 - orientation 3개 + 방위 1개 = 4개 = 관절 4개(torso_yaw + 왼팔 3)라
-        // 딱 결정계(대화 참고). 예전엔 내적 cone 제약 2개(X축/Y축)만 걸었는데, 그건
-        // orientation 자유도를 2개만 묶어서 나머지 roll이 임의로 남았고, 목표를 완전
-        // 정렬(내적 1)로 두면 gradient까지 죽는 문제가 있었음.
-        //
-        // 목표 자세를 만드는 순서(전부 기존 튜닝 각도를 그대로 재사용):
-        //   1) reach_dir  : base_link(원점) -> place_release_settled_ee_pos_(위치 IK가
-        //                   끝나 실측이 도달한 그 순간의 EE) 수평 방향 - 그 방위를
-        //                   그대로 유지시키는 게 목적(대화 참고)
-        //   2) y_reference: reach_dir을 Z축으로 y_reference_rotation만큼 돌린 수평 방향
-        //                   (기본 90도 = reach_dir에 수직)
-        //   3) x_dir      : world +Z를 y_reference 축으로 x_angle만큼 기울인 방향
-        //                   (= reach_dir을 품은 수직면 안에서 기울어짐)
-        //   4) y_dir      : x_dir에 수직인 평면 안에서, 수평면에서 world +Z 쪽으로
-        //                   y_angle만큼 들린 방향(양수 = 위로)
-        //   5) z_dir      : x_dir x y_dir (오른손 좌표계 완성)
-        // 목표 수평 방위도 reach_dir 그대로 - 정렬 중에도 EE의 x,y 기울기가 도달
-        // 당시의 기울기에서 안 벗어나게 잡아둠(좌우로 밀리는 걸 막음).
-        Eigen::Vector3d reach_dir(
-          place_release_settled_ee_pos_.x(), place_release_settled_ee_pos_.y(), 0.0);
-        if (reach_dir.norm() < 1e-6) {
-          // 목표가 base_link 바로 위/아래라 수평 방위를 정의할 수 없음 - 예전처럼
-          // world +X를 기준으로 삼아 최소한 자세는 맞추게 함.
-          reach_dir = Eigen::Vector3d(1.0, 0.0, 0.0);
-        }
-        reach_dir.normalize();
-
-        const Eigen::Vector3d y_reference =
+        // 위치 IK가 끝난 순간의 x/y를 직접 고정하고 z만 설정한 offset만큼 내린다.
+        // 방위(y/x 비율)만 잡던 방식과 달리 같은 방위 선을 따라 앞뒤로 밀리는 자유도가 없다.
+        // 목표 로컬 Y축: world Y축을 world X축 둘레로 y_angle만큼 돌려서 수평면에서
+        // world +Z 쪽으로 y_angle만큼 들어올린 방향(양수 = 위로). x_dir이 사라져서
+        // 예전처럼 roll을 역산할 필요가 없어졌고, y_angle이 곧 그대로 수평 기울기임.
+        const Eigen::Vector3d target_y_dir =
           Eigen::AngleAxisd(
-          ik_tuning_.place_release_orientation_y_reference_rotation_rad,
-          Eigen::Vector3d::UnitZ()).toRotationMatrix() * reach_dir;
-        const Eigen::Vector3d x_dir =
-          Eigen::AngleAxisd(ik_tuning_.place_release_orientation_x_angle_rad, y_reference) *
-          Eigen::Vector3d::UnitZ();
-        // y_dir: x_dir에 수직인 평면 안에서, 수평면 기준 world +Z 쪽으로
-        // y_angle만큼 들린 방향. y_angle을 x_dir 둘레의 roll로 그대로 쓰면 x_dir이
-        // 기울어진 만큼 실제 수평 기울기가 줄어들어(sin 관계) 파라미터 값과 결과가
-        // 달라지므로, 원하는 기울기를 만들어내는 roll을 역산해서 씀(대화 참고).
-        //   y_dir = y_reference*cos(roll) + z_reference*sin(roll)  (y_reference는 수평)
-        //   => y_dir.z = z_reference.z * sin(roll) = sin(y_angle)
-        // z_reference.z의 크기가 곧 도달 가능한 최대 기울기(|sin(x_angle)|)라, 그보다
-        // 큰 각도를 요구하면 도달 가능한 최대치로 clamp됨.
-        const Eigen::Vector3d z_reference = x_dir.cross(y_reference);
-        double y_roll = 0.0;
-        if (std::abs(z_reference.z()) > 1e-9) {
-          y_roll = std::asin(
-            std::clamp(
-              std::sin(ik_tuning_.place_release_orientation_y_angle_rad) / z_reference.z(),
-              -1.0, 1.0));
-        }
-        const Eigen::Vector3d y_dir = Eigen::AngleAxisd(y_roll, x_dir) * y_reference;
-        Eigen::Matrix3d target_rotation;
-        target_rotation.col(0) = x_dir;
-        target_rotation.col(1) = y_dir;
-        target_rotation.col(2) = x_dir.cross(y_dir);
+          ik_tuning_.place_release_orientation_y_angle_rad, Eigen::Vector3d::UnitX()) *
+          Eigen::Vector3d::UnitY();
+        // 목표 높이: 위치 IK가 끝나 실측이 도달한 그 순간의 EE z에서 offset만큼
+        // 내린 값(place_release_target_z_offset_m, 음수 = 아래로).
+        Eigen::Vector3d release_target_position = place_release_settled_ee_pos_;
+        release_target_position.z() += ik_tuning_.place_release_target_z_offset_m;
 
         ik::IkStepParams orientation_params;
         orientation_params.tol = 1.0 - ik_tuning_.place_release_orientation_align_threshold;
@@ -1590,11 +1563,17 @@ void ManipulationFSM::stepPlaceIk(bool opening_gripper)
           ik_tuning_.trust_region_acceptable_ratio;
         orientation_params.orientation_weight =
           ik_tuning_.place_release_orientation_weight;
-        orientation_params.bearing_weight = ik_tuning_.place_release_bearing_weight;
+        orientation_params.position_xy_weight =
+          ik_tuning_.place_release_position_xy_weight;
+        orientation_params.height_weight = ik_tuning_.place_release_height_weight;
+        // 관절 가중치 - 값이 큰 관절일수록 덜 쓰게 벌점(어깨를 무겁게 두면 허리/팔꿈치
+        // 위주로 자세를 맞춤). scale이 0이면 이 정규화 항 자체가 꺼짐.
+        orientation_params.joint_weights = ik_tuning_.place_release_joint_weights;
+        orientation_params.joint_weight_scale = ik_tuning_.place_release_joint_weight_scale;
 
-        const ik::IkStepResult orientation_result = ik::orientationBearingStep(
-          robot_model_, target_rotation, Eigen::Vector2d(reach_dir.x(), reach_dir.y()),
-          q_, place_release_orientation_damping_, orientation_params);
+        const ik::IkStepResult orientation_result = ik::yAxisPositionStep(
+          robot_model_, target_y_dir, release_target_position, q_,
+          place_release_orientation_damping_, orientation_params);
         q_ = orientation_result.q;
         place_release_orientation_damping_ = orientation_result.damping;
 

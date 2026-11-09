@@ -71,7 +71,7 @@ manipulation_node_cpp:
     # ik_step 내부의 weighted 정규화 계수: [torso_yaw, l_shoulder_pitch,
     # l_shoulder_roll, l_elbow_pitch]. 값이 클수록 그 관절을 더 아껴 씀(torso_yaw는
     # 1로 웬만하면 torso로 풀게 유도, joint_weight_scale과 짝).
-    ik.joint_weights: [1.0, 5.0, 1.0, 30.0]
+    ik.joint_weights: [1.0, 5.0, 1.0, 5.0]
 
     # PLACE(VIRTUAL_PLACE) 전용 joint_weights - PICK과 반대로 torso_yaw를 더
     # 아끼고(허리를 덜 쓰고) 팔 위주로 풀게 함. state_changed 시점에
@@ -116,26 +116,28 @@ manipulation_node_cpp:
     place.release_torso_settle_velocity_threshold: 0.1
     place.release_torso_settle_position_tolerance_rad: 0.1
 
-    # 그리퍼 오픈 시퀀스의 orientation 3개 + y/x 방위 1개 가중 오차 tolerance를 만듦.
+    # 그리퍼 오픈 시퀀스의 Y축 정렬 + x/y/z 위치 가중 오차 tolerance를 만듦.
     # 실제 tol은 1.0 - 이 값이므로 0.95이면 0.05.
-    place.release_orientation_align_threshold: 0.95
+    place.release_orientation_align_threshold: 0.46
 
-    # 목표 자세(회전행렬)를 만드는 두 각도(도) - fsm.hpp place_release_orientation_x/y_angle_rad
-    #   x: 로컬 X축이 world +Z에서 기울어지는 각도. 부호가 +면 목표 쪽, -면 로봇 쪽.
-    #   y: 로컬 Y축이 수평면에서 world +Z 쪽으로 들리는 각도(양수 = 위로).
-    place.release_orientation_x_angle_deg: -65.0
+    # 로컬 Y축이 수평면에서 world +Z 쪽으로 들리는 목표 각도(양수 = 위로).
     place.release_orientation_y_angle_deg: 0.0
 
-    # orientation 3개와 EE 위치의 y/x 방위를 같은 LSQ로 풀 때 쓰는 task-space 가중치.
-    # 방위는 orientation보다 3배 크게 반영하고, 수렴 판정에도 같은 가중치를 적용함.
+    # Y축 정렬과 EE x/y/z 위치를 같은 LSQ로 풀 때 쓰는 task-space 가중치.
+    # 위치를 orientation보다 5배 크게 반영해서 공을 놓는 지점을 우선함.
     place.release_orientation_weight: 1.0
-    place.release_bearing_weight: 3.0
+    place.release_position_xy_weight: 5.0
+    place.release_height_weight: 5.0
 
-    # 목표 자세의 "기준 방향"을 만드는 회전각(도) - base_link(원점)에서 target_pos_로
-    # 향하는 수평 벡터에 Z축 회전행렬을 이 각도로 곱해서 기준 방향을 만듦(fsm.hpp
-    # place_release_orientation_y_reference_rotation_rad 필드 주석 참고).
-    # 90 = 목표 방향에 수직, 0 = 목표 방향 그 자체.
-    place.release_orientation_y_reference_rotation_deg: 90.0
+    # 놓는 자세 정렬의 목표 z를 "도달 시점 EE z + 이 값"으로 잡음(음수 = 아래로).
+    place.release_target_z_offset_m: -0.08
+
+    # 같은 스텝 전용 joint_weights [torso, sh_pitch, sh_roll, elbow] - 값이 클수록 그
+    # 관절을 덜 씀. 어깨를 무겁게 둬서 허리/팔꿈치 위주로 자세를 맞추게 함.
+    # scale이 0이면 이 정규화 자체가 꺼짐(ik.joint_weight_scale과 동일한 구조).
+    place.release_joint_weights: [1.0, 1.0, 1.0, 1.0]
+    place.release_joint_weight_scale: 0.0
+
 
     # PICK 접근 궤적(PICK_READY -> PICK 전이 시점의 EE -> 비전 캡처 목표, 2점) 전체
     # 소요 시간(초) - place와 달리 정점 없이 직행.

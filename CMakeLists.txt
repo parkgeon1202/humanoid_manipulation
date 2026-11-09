@@ -12,7 +12,7 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(dynamixel_hardware_msgs REQUIRED)
+find_package(dynamixel_interfaces REQUIRED)
 find_package(irc_humanoid_interfaces REQUIRED)
 
 # --- C++ IK 라이브러리(include/ik, src/ik) 의존성: lib/ik_solver.py + lib/collision_model.py 포팅용 ---
@@ -51,7 +51,7 @@ ament_target_dependencies(main_node
   std_msgs
   sensor_msgs
   geometry_msgs
-  dynamixel_hardware_msgs
+  dynamixel_interfaces
   irc_humanoid_interfaces
   visualization_msgs
 )
@@ -63,7 +63,7 @@ target_include_directories(debug_ik_node PRIVATE include)
 target_link_libraries(debug_ik_node ik_lib)
 ament_target_dependencies(debug_ik_node
   rclcpp
-  dynamixel_hardware_msgs
+  dynamixel_interfaces
   irc_humanoid_interfaces
   sensor_msgs
   visualization_msgs
@@ -79,7 +79,7 @@ ament_target_dependencies(master_node
   std_msgs
   geometry_msgs
   irc_humanoid_interfaces
-  dynamixel_hardware_msgs
+  dynamixel_interfaces
 )
 
 install(TARGETS main_node debug_ik_node master_node

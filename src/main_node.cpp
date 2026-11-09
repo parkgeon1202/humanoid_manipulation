@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -22,13 +23,14 @@
 
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
-#include "dynamixel_hardware_msgs/msg/current_motor_status.hpp"
-#include "dynamixel_hardware_msgs/msg/dynamixel_control_msgs.hpp"
-#include "dynamixel_hardware_msgs/msg/dynamixel_msgs.hpp"
+#include "dynamixel_interfaces/msg/dynamixel_control_msgs.hpp"
+#include "dynamixel_interfaces/msg/dynamixel_msgs.hpp"
+#include "dynamixel_interfaces/msg/dynamixel_state_msgs.hpp"
 #include "fsm.hpp"
 #include "irc_humanoid_interfaces/msg/master2_vision_msg.hpp"
 #include "irc_humanoid_interfaces/msg/motion_operator.hpp"
 #include "irc_humanoid_interfaces/msg/vision2_mani_msg.hpp"
+#include "motor_io.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "std_msgs/msg/bool.hpp"
@@ -36,9 +38,9 @@
 
 using CallbackReturn =
   rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
-using dynamixel_hardware_msgs::msg::CurrentMotorStatus;
-using dynamixel_hardware_msgs::msg::DynamixelControlMsgs;
-using dynamixel_hardware_msgs::msg::DynamixelMsgs;
+using dynamixel_interfaces::msg::DynamixelControlMsgs;
+using dynamixel_interfaces::msg::DynamixelMsgs;
+using dynamixel_interfaces::msg::DynamixelStateMsgs;
 using irc_humanoid_interfaces::msg::Master2VisionMsg;
 using irc_humanoid_interfaces::msg::MotionOperator;
 using irc_humanoid_interfaces::msg::Vision2ManiMsg;
@@ -48,9 +50,9 @@ using visualization_msgs::msg::Marker;
 
 namespace
 {
-// motor_status(CurrentMotorStatus)/dynamixel_control(DynamixelControlMsgs)의
-// 배열은 이 순서(모터 id)대로 채워짐 -> 인덱스 i가 kMotorIdOrder[i]에 대응.
-// tilt(23번)는 이 시스템에서 아예 제어 안 해서 목록에서 뺌(fsm.cpp와 동일해야 함).
+// 이 노드가 상태를 읽고 명령을 보내는 모터 id(fsm.cpp와 동일해야 함). 메시지
+// 원소마다 id가 실려 있어서 배열 순서와는 상관없음 - 상태는 id로 찾고, 명령은 이
+// 순서로 채움. tilt(23번)는 제어는 안 하고 상태만 읽음(kTiltMotorId).
 const std::vector<std::string> kMotorIdOrder = {
   "0", "1", "2", "3", "4", "5", "6",
   "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21",
@@ -59,6 +61,8 @@ const std::vector<std::string> kMotorIdOrder = {
 // 그립 모터(6번)는 이제 combined /dynamixel_control이 아니라 gripper_topic_로 단독
 // 전송함(kMotorIdOrder에서 위치 파악용으로는 여전히 필요해서 목록 자체는 유지).
 const std::string kGripMotorId = "6";
+// 카메라 tilt 모터 - 상태(실측 위치/속도)만 읽음(VIRTUAL_PLACE의 isTiltSettled()용).
+const std::string kTiltMotorId = "23";
 
 // /master/pan_tilt(Master2VisionMsg)에 보내는 place용 tilt 모드 번호.
 constexpr int32_t kPlaceTiltMode = 5;
@@ -80,6 +84,20 @@ public:
 
   CallbackReturn on_configure(const State &) override {
     declare_and_get_params();
+
+    // /motor_status에 반드시 있어야 하는 id = 명령/판정에 쓰는 모터 전부 + tilt.
+    // 다리도 "그 순간 실측 위치로 고정" 명령(fsm.cpp kLegMotorIds)에 쓰여서 필요함.
+    std::vector<std::string> required = kMotorIdOrder;
+    required.push_back(kTiltMotorId);
+    required_status_ids_ = motor_io::parse_motor_ids(required);
+    const auto grip_id = motor_io::parse_motor_id(kGripMotorId);
+    const auto tilt_id = motor_io::parse_motor_id(kTiltMotorId);
+    if (required_status_ids_.empty() || !grip_id || !tilt_id) {
+      RCLCPP_ERROR(get_logger(), "Invalid or duplicated motor id in kMotorIdOrder/grip/tilt");
+      return CallbackReturn::FAILURE;
+    }
+    grip_motor_id_ = *grip_id;
+    tilt_motor_id_ = *tilt_id;
     create_activate_cmd_sub();
 
     RCLCPP_INFO(get_logger(), "Configured. Waiting for activate_cmd.");
@@ -89,6 +107,8 @@ public:
   CallbackReturn on_activate(const State &) override {
     deactivate_pending_ = false;
     deferred_deactivate_timer_.reset();
+    // 이전 활성화 때 받은 상태로 명령을 내보내지 않게 매번 비움.
+    last_valid_status_ns_.store(0);
 
     // 모터 명령/상태는 매 주기 계속 갱신되는 스트림이라 최신 값만 중요 ->
     // BEST_EFFORT + depth=1.
@@ -112,9 +132,9 @@ public:
     auto marker_qos = rclcpp::QoS(rclcpp::KeepLast(5)).reliable();
     target_marker_pub_ = create_publisher<Marker>("/target_marker", marker_qos);
     trajectory_marker_pub_ = create_publisher<Marker>("/trajectory_marker", marker_qos);
-    status_sub_ = create_subscription<CurrentMotorStatus>(
+    status_sub_ = create_subscription<DynamixelStateMsgs>(
       status_topic_, motor_qos,
-      [this](const CurrentMotorStatus::SharedPtr msg) {on_motor_status(msg);});
+      [this](const DynamixelStateMsgs::SharedPtr msg) {on_motor_status(msg);});
 
     // 비전 노드가 보내는 원본 좌표(공/골대 x/y/z 둘 다 포함, mm 단위). master(task_planner)를
     // 거치지 않고 직접 구독함 - on_vision2mani()에서 activate_count_ 홀짝으로 이번 활성화
@@ -202,6 +222,7 @@ private:
     control_topic_ = declare_parameter<std::string>("control_topic", "/dynamixel_control");
     gripper_topic_ = declare_parameter<std::string>("gripper_topic", "/gripper_control");
     status_topic_ = declare_parameter<std::string>("status_topic", "/motor_status");
+    status_timeout_sec_ = declare_parameter<double>("status_timeout_sec", 0.2);
     pan_tilt_topic_ = declare_parameter<std::string>("pan_tilt_topic", "/master/pan_tilt");
     step_period_sec_ = declare_parameter<double>("ik.step_period_sec", 0.02);
 
@@ -261,24 +282,22 @@ private:
     tuning.place_release_torso_settle_position_tolerance_rad =
       declare_parameter<double>("place.release_torso_settle_position_tolerance_rad", 0.05);
     // place_release_orientation_align_threshold 필드 주석 참고 - 그리퍼 오픈 시퀀스가
-    // "놓는 자세"(로컬 +X축을 world +Z에 정렬)로 수렴시킬 때 씀.
+    // "놓는 자세"(로컬 Y축 방향 + EE 위치)로 수렴시킬 때 씀.
     tuning.place_release_orientation_align_threshold =
       declare_parameter<double>("place.release_orientation_align_threshold", 0.95);
-    // place_release_orientation_x/y_angle_rad 필드 주석 참고 - 각 축을 목표 방향에서
-    // 일부러 이만큼(도) 벌린 상태를 목표로 함(0이면 완전 정렬).
-    tuning.place_release_orientation_x_angle_rad =
-      declare_parameter<double>("place.release_orientation_x_angle_deg", 0.0) * M_PI / 180.0;
+    // place_release_orientation_y_angle_rad 필드 주석 참고.
     tuning.place_release_orientation_y_angle_rad =
       declare_parameter<double>("place.release_orientation_y_angle_deg", 30.0) * M_PI / 180.0;
     tuning.place_release_orientation_weight =
       declare_parameter<double>("place.release_orientation_weight", 1.0);
-    tuning.place_release_bearing_weight =
-      declare_parameter<double>("place.release_bearing_weight", 3.0);
-    // place_release_orientation_y_reference_rotation_rad 필드 주석 참고 - 목표 자세의
-    // 기준 방향을 만들 때 base_link -> target_pos_ 수평 벡터를 Z축으로 이만큼(도) 회전.
-    tuning.place_release_orientation_y_reference_rotation_rad =
-      declare_parameter<double>("place.release_orientation_y_reference_rotation_deg", 90.0) *
-      M_PI / 180.0;
+    tuning.place_release_position_xy_weight =
+      declare_parameter<double>("place.release_position_xy_weight", 5.0);
+    tuning.place_release_height_weight =
+      declare_parameter<double>("place.release_height_weight", 5.0);
+    tuning.place_release_target_z_offset_m =
+      declare_parameter<double>("place.release_target_z_offset_m", -0.08);
+    tuning.place_release_joint_weight_scale =
+      declare_parameter<double>("place.release_joint_weight_scale", 0.0);
 
     // [torso_yaw, left_shoulder_pitch, left_shoulder_roll, left_elbow_pitch] -
     // left_shoulder_roll 기본값은 ik.left_shoulder_roll_target_rad와 동일하게 0.3.
@@ -290,6 +309,11 @@ private:
       "ik.place_joint_weights", std::vector<double>{10.0, 1.0, 1.0, 1.0});
     const std::vector<double> complete_place_joint_weights_4 = declare_parameter<std::vector<double>>(
       "ik.complete_place_joint_weights", std::vector<double>{100.0, 1.0, 1.0, 1.0});
+    // 놓는 자세 정렬(yAxisPositionStep) 전용 joint_weights - [torso, sh_pitch,
+    // sh_roll, elbow] 순서. 값이 클수록 그 관절을 덜 씀(어깨를 무겁게 두는 용도).
+    const std::vector<double> place_release_joint_weights_4 =
+      declare_parameter<std::vector<double>>(
+      "place.release_joint_weights", std::vector<double>{1.0, 5.0, 5.0, 1.0});
     tuning.joint_weight_scale = declare_parameter<double>("ik.joint_weight_scale", 0.0);
     tuning.secondary_gain = declare_parameter<double>("ik.secondary_gain", 1.0);
     tuning.orientation_align_k_pull =
@@ -341,6 +365,7 @@ private:
     tuning.joint_weights = Eigen::VectorXd::Ones(nq);
     tuning.place_joint_weights = Eigen::VectorXd::Ones(nq);
     tuning.complete_place_joint_weights = Eigen::VectorXd::Ones(nq);
+    tuning.place_release_joint_weights = Eigen::VectorXd::Ones(nq);
     if (home_q.size() >= 4) {
       tuning.home_q_full[ik::kTorsoJointIndex] = home_q[0];
       for (int i = 0; i < 3; ++i) tuning.home_q_full[ik::kLeftArmIndices[i]] = home_q[i + 1];
@@ -360,6 +385,13 @@ private:
       for (int i = 0; i < 3; ++i) {
         tuning.complete_place_joint_weights[ik::kLeftArmIndices[i]] =
           complete_place_joint_weights_4[i + 1];
+      }
+    }
+    if (place_release_joint_weights_4.size() >= 4) {
+      tuning.place_release_joint_weights[ik::kTorsoJointIndex] = place_release_joint_weights_4[0];
+      for (int i = 0; i < 3; ++i) {
+        tuning.place_release_joint_weights[ik::kLeftArmIndices[i]] =
+          place_release_joint_weights_4[i + 1];
       }
     }
 
@@ -391,29 +423,49 @@ private:
 
   // 데이터만 fsm_에 써넣음(내부적으로 자체 락 보호) - on_motor_feedback()은 더
   // 이상 여기서 안 부르고 on_solve_tick()이 매 tick 부름.
-  void on_motor_status(const CurrentMotorStatus::SharedPtr msg) {
+  // id 검사(motor_io.hpp 참고)를 통과한 메시지만 씀 - 실패하면 fsm_ 값은 이전
+  // 그대로 두고 경고만 남김(일부만 갱신하지 않음).
+  void on_motor_status(const DynamixelStateMsgs::SharedPtr msg) {
+    std::map<uint8_t, motor_io::MotorState> states;
+    std::string reason;
+    const rclcpp::Time now = get_clock()->now();
+    if (!motor_io::decode_status(
+        *msg, now, status_timeout_sec_, required_status_ids_, states, reason))
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000, "Drop motor_status: %s", reason.c_str());
+      return;
+    }
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 1000,
-      "motor_status received: %zu motor(s)", msg->position.size());
+      "motor_status received: %zu motor(s)", msg->motor_state.size());
 
-    const size_t n = std::min(kMotorIdOrder.size(), msg->position.size());
-    for (size_t i = 0; i < n; ++i) {
-      fsm_->set_motor_position(kMotorIdOrder[i], msg->position[i]);
+    for (const auto & motor_id : kMotorIdOrder) {
+      const auto & state = states.at(*motor_io::parse_motor_id(motor_id));
+      fsm_->set_motor_position(motor_id, state.position);
+      fsm_->set_motor_velocity(motor_id, state.velocity);
     }
-    const size_t nv = std::min(kMotorIdOrder.size(), msg->velocity.size());
-    for (size_t i = 0; i < nv; ++i) {
-      fsm_->set_motor_velocity(kMotorIdOrder[i], msg->velocity[i]);
-    }
+    // tilt(23번)는 kMotorIdOrder에 없어서(제어 안 함) id로 따로 꺼내서 fsm_에 넣어줌
+    // (VIRTUAL_PLACE 비전 캡처가 isTiltSettled()로 카메라가 레벨까지 실제로 돌아왔는지
+    // 확인하는 용도).
+    const auto & tilt = states.at(tilt_motor_id_);
+    fsm_->set_tilt_position(tilt.position);
+    fsm_->set_tilt_velocity(tilt.velocity);
 
-    // tilt(23번)는 kMotorIdOrder에 없어서(제어 안 함) 위 루프에서 안 채워짐 - 배열
-    // 맨 끝이 tilt 실측값이라 따로 빼서 fsm_에 넣어줌(VIRTUAL_PLACE 비전 캡처가
-    // isTiltSettled()로 카메라가 레벨까지 실제로 돌아왔는지 확인하는 용도).
-    if (!msg->position.empty()) {
-      fsm_->set_tilt_position(msg->position.back());
+    last_valid_status_ns_.store(now.nanoseconds());
+  }
+
+  // 마지막으로 검사를 통과한 /motor_status가 status_timeout_sec_ 이내인지. fsm_의
+  // 목표 중 "실측 위치로 고정"은 이 값을 그대로 쓰므로, 상태가 없거나 끊긴 채로
+  // 명령을 보내면 다리/팔이 0 rad나 옛 위치로 튈 수 있음.
+  bool status_fresh() {
+    const int64_t last_ns = last_valid_status_ns_.load();
+    if (last_ns == 0) {
+      return false;
     }
-    if (!msg->velocity.empty()) {
-      fsm_->set_tilt_velocity(msg->velocity.back());
-    }
+    const double age_sec =
+      (get_clock()->now().nanoseconds() - last_ns) * 1e-9;
+    return age_sec <= status_timeout_sec_;
   }
 
   // activate_count_는 on_activate()에서 매 활성화마다 1씩 늘어남 - 홀수 번째
@@ -515,37 +567,68 @@ private:
     trajectory_marker_pub_->publish(trajectory_marker);
   }
 
+  // 원소마다 id를 채워서 보냄. fsm_가 목표를 한 번도 안 정한 모터는 빼고 보냄 -
+  // kid_rl이 그 모터의 현재 목표를 그대로 유지함(예전처럼 0 rad를 보내지 않음).
+  // 값 하나라도 잘못되면 팔/그리퍼 둘 다 이번 명령을 통째로 안 보냄.
+  void publish_motor_command(const FsmAction & action) {
+    if (!status_fresh()) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Motor command not sent: no valid motor_status within %.3f s",
+        status_timeout_sec_);
+      return;
+    }
+
+    const auto stamp = get_clock()->now();
+    std::string reason;
+    DynamixelControlMsgs control_msg;
+    control_msg.motor_control.reserve(kMotorIdOrder.size() - 1);
+    for (const auto & motor_id : kMotorIdOrder) {
+      if (motor_id == kGripMotorId) {
+        continue;
+      }
+      const auto it = action.motor_goal_positions.find(motor_id);
+      if (it == action.motor_goal_positions.end()) {
+        continue;
+      }
+      DynamixelMsgs motor_msg;
+      if (!motor_io::make_command(
+          *motor_io::parse_motor_id(motor_id), it->second, action.profile_velocity, stamp,
+          motor_msg, reason))
+      {
+        RCLCPP_ERROR(get_logger(), "Motor command not sent: %s", reason.c_str());
+        return;
+      }
+      control_msg.motor_control.push_back(motor_msg);
+    }
+
+    std::optional<DynamixelMsgs> gripper_msg;
+    const auto grip_it = action.motor_goal_positions.find(kGripMotorId);
+    if (grip_it != action.motor_goal_positions.end()) {
+      gripper_msg.emplace();
+      if (!motor_io::make_command(
+          grip_motor_id_, grip_it->second, action.profile_velocity, stamp, *gripper_msg,
+          reason))
+      {
+        RCLCPP_ERROR(get_logger(), "Motor command not sent: %s", reason.c_str());
+        return;
+      }
+    }
+
+    // 빈 배열은 kid_rl이 거부하므로 안 보냄.
+    if (!control_msg.motor_control.empty()) {
+      control_pub_->publish(control_msg);
+    }
+    if (gripper_msg) {
+      gripper_pub_->publish(*gripper_msg);
+    }
+  }
+
   // fsm_가 반환한 액션을 기계적으로 ROS 액션으로 옮김 - 판단 없음. action은 이미
   // 스냅샷된 값이라 fsm_에 다시 접근하지 않음.
   void apply_action(const FsmAction & action) {
     if (action.publish_motor_command) {
-      const auto stamp = get_clock()->now();
-
-      DynamixelControlMsgs control_msg;
-      control_msg.motor_control.reserve(kMotorIdOrder.size() - 1);
-      for (const auto & motor_id : kMotorIdOrder) {
-        if (motor_id == kGripMotorId) {
-          continue;
-        }
-        DynamixelMsgs motor_msg;
-        motor_msg.header.stamp = stamp;
-        auto it = action.motor_goal_positions.find(motor_id);
-        motor_msg.goal_position =
-          static_cast<float>(it != action.motor_goal_positions.end() ? it->second : 0.0);
-        motor_msg.profile_acceleration = 0.0f;
-        motor_msg.profile_velocity = static_cast<float>(action.profile_velocity);
-        control_msg.motor_control.push_back(motor_msg);
-      }
-      control_pub_->publish(control_msg);
-
-      DynamixelMsgs gripper_msg;
-      gripper_msg.header.stamp = stamp;
-      auto grip_it = action.motor_goal_positions.find(kGripMotorId);
-      gripper_msg.goal_position =
-        static_cast<float>(grip_it != action.motor_goal_positions.end() ? grip_it->second : 0.0);
-      gripper_msg.profile_acceleration = 0.0f;
-      gripper_msg.profile_velocity = static_cast<float>(action.profile_velocity);
-      gripper_pub_->publish(gripper_msg);
+      publish_motor_command(action);
     }
 
     if (action.play_motion_number.has_value()) {
@@ -594,7 +677,7 @@ private:
   rclcpp::Publisher<Master2VisionMsg>::SharedPtr pan_tilt_pub_;
   rclcpp::Publisher<Marker>::SharedPtr target_marker_pub_;
   rclcpp::Publisher<Marker>::SharedPtr trajectory_marker_pub_;
-  rclcpp::Subscription<CurrentMotorStatus>::SharedPtr status_sub_;
+  rclcpp::Subscription<DynamixelStateMsgs>::SharedPtr status_sub_;
   rclcpp::Subscription<Vision2ManiMsg>::SharedPtr vision_sub_;
   rclcpp::Publisher<MotionOperator>::SharedPtr motion_operator_pub_;
   rclcpp::Subscription<MotionOperator>::SharedPtr motion_end_sub_;
@@ -610,6 +693,14 @@ private:
   std::string status_topic_;
   std::string pan_tilt_topic_;
   double step_period_sec_ = 0.02;
+  // /motor_status가 이보다 오래되면 버리고, 마지막 정상 상태가 이보다 오래되면 모터
+  // 명령을 안 보냄.
+  double status_timeout_sec_ = 0.2;
+  std::vector<uint8_t> required_status_ids_;
+  uint8_t grip_motor_id_ = 6;
+  uint8_t tilt_motor_id_ = 23;
+  // 메시지 콜백 스레드가 쓰고 solve_tick 스레드가 읽음(0 = 아직 없음).
+  std::atomic<int64_t> last_valid_status_ns_{0};
   // on_activate()마다 1씩 증가 - on_vision2mani()가 이번이 몇 번째 활성화인지로
   // ball_cam/goal_post_cam 중 어느 쪽을 넘길지 판단하는 데 씀.
   int activate_count_ = 0;

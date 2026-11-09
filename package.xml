@@ -16,7 +16,7 @@
   <depend>sensor_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>geometry_msgs</depend>
-  <depend>dynamixel_hardware_msgs</depend>
+  <depend>dynamixel_interfaces</depend>
   <depend>irc_humanoid_interfaces</depend>
 
   <!-- C++ IK 라이브러리(include/ik, src/ik) 의존성: lib/ik_solver.py + lib/collision_model.py의

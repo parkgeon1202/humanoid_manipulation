@@ -75,6 +75,9 @@ struct IkStepParams {
   // 판정에 동일하게 적용함. 1보다 큰 쪽의 실제 오차를 더 작게 줄여야 수렴함.
   double orientation_weight = 1.0;
   double bearing_weight = 1.0;
+  // yAxisPositionStep의 수평 위치(x/y)와 높이(z) 행 가중치.
+  double position_xy_weight = 1.0;
+  double height_weight = 1.0;
 };
 
 struct IkStepResult {
@@ -191,6 +194,23 @@ IkStepResult orientationBearingStep(RobotModel& rm, const Eigen::Matrix3d& targe
                                      const Eigen::VectorXd& q, double damping,
                                      const IkStepParams& params,
                                      const CollisionCheckFn& collision_checker = nullptr);
+
+// 로컬 Y축을 target_y_direction에 최대한 맞추면서 EE의 x/y/z 위치를 직접 유지하는
+// 한 스텝. 활성 관절은 torso_yaw + 왼팔 3관절(4 DOF)이다.
+// 과제 구성(총 6행, 실효 rank 최대 5인 가중 최소자승):
+//   - y축 정렬 3행: 현재 로컬 Y축을 target_y_direction으로 보내는 회전벡터(axis*angle).
+//     실효 rank는 2.
+//   - position 3행: target_position - 현재 EE 위치. x/y에는 position_xy_weight,
+//     z에는 height_weight가 적용됨.
+// 4관절로 실효 제약 5개를 모두 정확히 만족시킬 수 없으므로 위치 가중치를 orientation보다
+// 크게 두면 공을 놓을 위치를 우선하고 Y축은 가능한 범위에서 최대한 맞춘다.
+// params.joint_weights / joint_weight_scale도 ikStep과 동일하게 적용됨(값이 큰 관절일수록
+// 덜 쓰게 벌점) - 활성 4관절에 해당하는 성분만 씀.
+IkStepResult yAxisPositionStep(RobotModel& rm, const Eigen::Vector3d& target_y_direction,
+                               const Eigen::Vector3d& target_position,
+                               const Eigen::VectorXd& q, double damping,
+                               const IkStepParams& params,
+                               const CollisionCheckFn& collision_checker = nullptr);
 
 namespace detail {
 // min ||A x - b||^2 s.t. lb <= x <= ub 를 active-set으로 품(box 제약만 지원, n<=8 정도의
